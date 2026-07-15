@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+    "cython >= 3.1.0",
+    "meson >= 1.0.0",
+    "meson-python >= 0.18.0",
+    "patchelf",
+    # cannot work yet since spy is not on PyPI
+    # "spy"
+]
+build-backend = "mesonpy"
+
+
+[project]
+name = "my-package"
+version = "0.1.0"
+license = "MIT"
+description = "Example SPy, Meson, Cython"
+readme = "README.md"
+maintainers = [
+    { name = "Pierre Augier", email = "pierre.augier@univ-grenoble-alpes.fr" },
+]
+# like SPy
+requires-python = "~=3.12.0"
+
+
+# useful to tell pytest that its rootdir is here
+[tool.pytest.ini_options]

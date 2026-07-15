@@ -1,0 +1,13 @@
+
+@struct
+class MyInt:
+    value: i32
+
+# one should be able to choose what is going to be exported
+
+# @py_export
+def add(x: i32, y: i32) -> i32:
+
+    _x = MyInt(x)
+    _y = MyInt(y)
+    return _x.value + _y.value

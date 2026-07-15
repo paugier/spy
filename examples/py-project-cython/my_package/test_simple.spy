@@ -1,0 +1,10 @@
+
+# note: it would be nice to have this file outside of
+# the Python package but SPy does not yet support
+# from ..my_package.simple import add
+
+from simple import add
+
+def main() -> None:
+
+    assert add(2, 2) == 4
