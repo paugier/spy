@@ -1,10 +1,12 @@
+from typing import Optional
+
 from spy.tests.support import CompilerTest, no_C
 from spy.vm.builtin import builtin_method
 from spy.vm.opspec import W_MetaArg, W_OpSpec
 from spy.vm.primitive import W_I32
 from spy.vm.registry import ModuleRegistry
 from spy.vm.vm import SPyVM
-from spy.vm.w import W_Object
+from spy.vm.w import W_Object, W_Type
 
 
 class W_MyClass(W_Object):
@@ -128,3 +130,27 @@ class TestItemop(CompilerTest):
         assert mod.set_and_get(0, 2, 24) == 24
         assert mod.set_and_get(2, 1, 99) == 99
         assert mod.get_default(1, 2) == 0
+
+    def test_generic_builtin_func_with_optional_arg(self):
+        EXT = ModuleRegistry("ext")
+
+        @EXT.builtin_func(color="blue", kind="generic")
+        def w_inc(vm: "SPyVM", w_n: W_I32, w_delta: W_I32 = None) -> W_I32:
+            if w_delta is None:
+                delta = 1
+            else:
+                delta = vm.unwrap_i32(w_delta)
+            return vm.wrap(vm.unwrap_i32(w_n) + delta)
+
+        self.vm.make_module(EXT)
+        mod = self.compile("""
+        from ext import inc
+
+        def with_default() -> i32:
+            return inc[1]
+
+        def with_explicit_n() -> i32:
+            return inc[1, 42]
+        """)
+        assert mod.with_default() == 2
+        assert mod.with_explicit_n() == 43
