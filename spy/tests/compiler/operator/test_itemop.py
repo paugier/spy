@@ -135,7 +135,7 @@ class TestItemop(CompilerTest):
         EXT = ModuleRegistry("ext")
 
         @EXT.builtin_func(color="blue", kind="generic")
-        def w_inc(vm: "SPyVM", w_n: W_I32, w_delta: W_I32 = None) -> W_I32:
+        def w_inc(vm: "SPyVM", w_n: W_I32, w_delta: W_I32 | None = None) -> W_I32:
             if w_delta is None:
                 delta = 1
             else:
