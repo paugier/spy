@@ -1,13 +1,6 @@
-"""
-Tests for align_offset(ptr, N, n) -> i32.
-
-Unlike cast/align_cast, align_offset's result type doesn't depend on
-anything (it's always i32), so N and n are ordinary runtime i32 values --
-no `[N]` bracket needed, same shape as ptr_copy(dst, src, n) & friends.
-"""
-
 import pytest
 
+from spy.errors import SPyError
 from spy.tests.support import CompilerTest
 
 
@@ -20,7 +13,8 @@ class TestAlignOffset(CompilerTest):
         """alloc[i32, 16] is guaranteed 16-aligned -> offset to 16 is 0."""
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32, 16] = {k}_alloc[i32, 16](10)
                 return align_offset(p, 16, 10)
@@ -36,7 +30,8 @@ class TestAlignOffset(CompilerTest):
         """
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_cast, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr, align_cast
             def test() -> i32:
                 strong: {k}_ptr[i32, 16] = {k}_alloc[i32, 16](10)
                 weak: {k}_ptr[i32, 1] = align_cast[1](strong)
@@ -47,17 +42,15 @@ class TestAlignOffset(CompilerTest):
     def test_computes_correct_offset(self, memkind):
         """
         Force a *known* misalignment relative to N by allocating one i8
-        "spacer" byte pointer first (so the i32 buffer's address is offset
-        by exactly 1 byte from whatever base alignment the allocator
-        happens to give), then ask for offset to reach a 64-byte boundary
-        with item size 4. We don't know the base address, so we can't
-        hardcode the expected offset -- instead we check the *property*
-        that defines correctness: (addr + offset*4) % 64 == 0, and that
-        offset is in [0, n].
+        "spacer" byte pointer first, then ask for offset to reach a
+        64-byte boundary with item size 4. We don't know the base address,
+        so we can't hardcode the expected offset -- instead we check the
+        *property* that defines correctness.
         """
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset, ptr_to_addr
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr, ptr_to_addr
             def test() -> i32:
                 spacer: {k}_ptr[i8] = {k}_alloc[i8](1)
                 p: {k}_ptr[i32] = {k}_alloc[i32](20)
@@ -80,7 +73,8 @@ class TestAlignOffset(CompilerTest):
         """
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](3)
                 return align_offset(p, 1048576, 3)
@@ -88,10 +82,10 @@ class TestAlignOffset(CompilerTest):
         assert mod.test() == 3
 
     def test_zero_n_is_always_zero(self, memkind):
-        """An empty buffer (n=0) can never need peeling: offset is 0."""
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](0)
                 return align_offset(p, 4096, 0)
@@ -99,10 +93,10 @@ class TestAlignOffset(CompilerTest):
         assert mod.test() == 0
 
     def test_N_equal_1_is_always_zero(self, memkind):
-        """Every address is trivially 1-aligned."""
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](10)
                 return align_offset(p, 1, 10)
@@ -110,10 +104,10 @@ class TestAlignOffset(CompilerTest):
         assert mod.test() == 0
 
     def test_null_pointer_is_always_zero(self, memkind):
-        """NULL (address 0) is aligned to everything."""
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32] = {k}_ptr[i32].NULL
                 return align_offset(p, 4096, 0)
@@ -128,7 +122,8 @@ class TestAlignOffset(CompilerTest):
         """
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 spacer: {k}_ptr[i8] = {k}_alloc[i8](1)
                 n: i32 = 37
@@ -149,19 +144,14 @@ class TestAlignOffset(CompilerTest):
             """)
         assert mod.test() == sum(range(1, 38))
 
-    def test_non_power_of_two_N(self, memkind):
-        """align_offset doesn't assume N is a power of two."""
+    def test_non_power_of_two_N_panics(self, memkind):
         k = memkind
         mod = self.compile(f"""
-            from unsafe import {k}_alloc, {k}_ptr, align_offset, ptr_to_addr
+            from simd import align_offset
+            from unsafe import {k}_alloc, {k}_ptr
             def test() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](50)
-                n: i32 = 50
-                offset: i32 = align_offset(p, 24, n)
-                addr: i32 = ptr_to_addr(p)
-                assert offset >= 0
-                assert offset <= n
-                assert (addr + offset * 4) % 24 == 0
-                return 1
+                return align_offset(p, 24, 50)
             """)
-        assert mod.test() == 1
+        with pytest.raises(SPyError):
+            mod.test()

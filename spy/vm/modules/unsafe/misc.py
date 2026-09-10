@@ -130,6 +130,14 @@ def w_alignof(vm: "SPyVM", w_T: W_Type) -> W_I32:
     return vm.wrap(alignof(w_T))
 
 
+@UNSAFE.builtin_func(color="blue")
+def w_sizeof(vm: "SPyVM", w_T: W_Type) -> W_I32:
+    """
+    The SPy-visible `sizeof(T)` blue builtin.
+    """
+    return vm.wrap(sizeof(w_T))
+
+
 def parse_optional_alignment(
     vm: "SPyVM", w_T: W_Type, args_w: tuple, funcname: str
 ) -> int:
