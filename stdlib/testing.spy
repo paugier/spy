@@ -1,0 +1,139 @@
+"""
+testing.spy -- minimal assertion helpers for SPy
+
+- assert_eq(a, b)
+- assert_ne(a, b)
+- assert_close(a, b, rtol=1e-8, atol=0.0)
+
+If both operands are blue (compile-time known), the comparison runs once
+at compile time and a failure is a compile error, not a runtime check --
+no code is generated for it at all. Otherwise it compiles into a runtime
+check.
+"""
+
+from operator import OpSpec
+
+
+@blue.metafunc
+def assert_eq(m_a, m_b):
+    """Like `assert a == b`, but better report on failure"""
+    a_src = m_a.source
+    b_src = m_b.source
+    filename = m_a.loc.filename
+    line = m_a.loc.line_start
+
+    if m_a.color == "blue" and m_b.color == "blue":
+        a_val = m_a.blueval
+        b_val = m_b.blueval
+        if a_val != b_val:
+            raise ValueError(
+                f"assert_eq failed at {filename}:{line}\n"
+                f"  left:  {a_src} = {a_val}\n"
+                f"  right: {b_src} = {b_val}"
+            )
+
+        # both blue and equal: nothing to check at runtime
+        def impl_noop() -> None:
+            pass
+
+        return OpSpec(impl_noop)
+
+    T = m_a.static_type
+
+    def impl(a: T, b: T) -> None:
+        if a != b:
+            raise ValueError(
+                f"assert_eq failed at {filename}:{line}\n"
+                f"  left:  {a_src} = {a}\n"
+                f"  right: {b_src} = {b}"
+            )
+
+    return OpSpec(impl)
+
+
+@blue.metafunc
+def assert_ne(m_a, m_b):
+    """Like `assert a != b`, but better report on failure"""
+    a_src = m_a.source
+    b_src = m_b.source
+    filename = m_a.loc.filename
+    line = m_a.loc.line_start
+
+    if m_a.color == "blue" and m_b.color == "blue":
+        a_val = m_a.blueval
+        b_val = m_b.blueval
+        if a_val == b_val:
+            raise ValueError(
+                f"assert_ne failed at {filename}:{line}\n"
+                f"  {a_src} and {b_src} are both {a_val}"
+            )
+
+        def impl_noop() -> None:
+            pass
+
+        return OpSpec(impl_noop)
+
+    T = m_a.static_type
+
+    def impl(a: T, b: T) -> None:
+        if a == b:
+            raise ValueError(
+                f"assert_ne failed at {filename}:{line}\n"
+                f"  {a_src} and {b_src} are both {a}"
+            )
+
+    return OpSpec(impl)
+
+
+@blue.metafunc
+def assert_close(m_a, m_b, m_rtol=None, m_atol=None):
+    """Approximate equality for floats"""
+    a_src = m_a.source
+    b_src = m_b.source
+    filename = m_a.loc.filename
+    line = m_a.loc.line_start
+
+    # rtol/atol must be compile-time constants. If the caller didn't
+    # pass them, m_rtol/m_atol are plain None (ordinary Python
+    # default-argument binding at the metafunc level, not a MetaArg).
+    # If they *were* passed, check color before touching blue_val --
+    # there's no try/except to recover if they turn out to be red.
+    if m_rtol is not None:
+        if m_rtol.color != "blue":
+            raise ValueError("assert_close: rtol must be a compile-time constant")
+        rtol = m_rtol.blueval
+    else:
+        rtol = 1e-8
+
+    if m_atol is not None:
+        if m_atol.color != "blue":
+            raise ValueError("assert_close: atol must be a compile-time constant")
+        atol = m_atol.blueval
+    else:
+        atol = 0.0
+
+    if m_a.color == "blue" and m_b.color == "blue":
+        a_val = m_a.blueval
+        b_val = m_b.blueval
+        if abs(a_val - b_val) > atol + rtol * abs(b_val):
+            raise ValueError(
+                f"assert_close failed at {filename}:{line}\n"
+                f"  left:  {a_src} = {a_val}\n"
+                f"  right: {b_src} = {b_val}\n"
+                f"  (rtol={rtol}, atol={atol})"
+            )
+
+        return OpSpec.const(None)
+
+    T = m_a.static_type
+
+    def impl(a: T, b: T) -> None:
+        if abs(a - b) > atol + rtol * abs(b):
+            raise ValueError(
+                f"assert_close failed at {filename}:{line}\n"
+                f"  left:  {a_src} = {a}\n"
+                f"  right: {b_src} = {b}\n"
+                f"  (rtol={rtol}, atol={atol})"
+            )
+
+    return OpSpec(impl)

@@ -1,0 +1,20 @@
+from operator import OpSpec
+
+
+@blue.metafunc
+def dbg(m_x):
+    """Print `[file:line] expr = value` and return the value unchanged,
+    so it can be dropped inline into any expression without
+    restructuring the surrounding code. Modeled on Rust's `dbg!` and the
+    `icecream` package's `ic()`."""
+    src = m_x.source
+    filename = m_x.loc.filename
+    line = m_x.loc.line_start
+
+    T = m_x.static_type
+
+    def impl(x: T) -> T:
+        print(f"[{filename}:{line}] {src} = {x}")
+        return x
+
+    return OpSpec(impl)
