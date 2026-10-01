@@ -1,8 +1,7 @@
 """
 Experiment: the `@heap` decorator, written with blue metaprogramming.
 
-DOES NOT RUN YET. See README.md for the list of missing features: in
-particular, the parser only accepts `@struct` as a class decorator.
+DOES NOT RUN YET. See README.md for the list of missing features.
 
 `heap(cls)` receives the class written by the user and returns the wrapper
 struct, i.e. what point_by_hand.spy writes by hand. The user code is in
@@ -19,11 +18,6 @@ def heap(cls):
     # Invented API, similar to what the dataclass note needs: the user's class
     # is exposed as an ordered {name: type} dict of fields...
     fields = cls.__annotations__  # {"x": i32, "y": i32}
-    # ...and an ordered {name: method} dict (__init__, norm2, ...). These are
-    # method *templates*: their `self` is not bound to any class yet.
-    methods = cls.__methods__
-    method_names = (*methods.keys(),)
-    N = len(method_names)
 
     @struct
     class _data:
@@ -32,6 +26,9 @@ def heap(cls):
     @struct
     class _heap:
         __ll__: gc_ptr[_data]
+        # an ordered {name: method} dict (__init__, norm2, ...). These are
+        # method *templates*: their `self` is not bound to any class yet.
+        __extra_methods__ = cls.__methods__
 
         @blue.metafunc
         def __getattribute__(m_self, m_name):
@@ -75,15 +72,5 @@ def heap(cls):
                 return self.__ll__ == other.__ll__
 
             return OpSpec(impl, [m_self, m_other])
-
-        # Inject the user-written methods. Proposed syntax: an unrolled loop
-        # in the class body (like `unroll_range` in function bodies), which
-        # binds one class attribute per iteration. `locals()` is the class
-        # namespace, as in a Python class body; since `i` is blue, each
-        # iteration binds a statically-known name. Assigning a method template
-        # re-evaluates its `def` in this class scope, so that `self` is
-        # `_heap` and not the original class.
-        for i in unroll_range(N):
-            locals()[method_names[i]] = methods[method_names[i]]
 
     return _heap

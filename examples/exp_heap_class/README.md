@@ -40,27 +40,49 @@ Still missing for the `@heap` decorator (part 2):
 
 ## Proposed syntax to inject the user methods
 
-`heap_decorator.spy` injects the methods with an unrolled loop in the body of
-the generated class:
+The decorator has to copy the user-written methods (`__init__`, `norm2`, ...)
+into the generated class. The simplest proposal is a second reserved local in
+the class body, by analogy with `__extra_fields__`:
 
-    for i in unroll_range(N):
-        locals()[method_names[i]] = methods[method_names[i]]
+```python
+@struct
+class _heap:
+    __ll__: gc_ptr[_data]
+    __extra_methods__ = cls.__methods__
 
-This needs three things:
+    # generated metafunctions: __getattribute__, __setattr__, __new__, ...
+```
 
-- `For` in a class body. Today: "`For` not supported inside a classdef"
-  (ClassFrame only allows VarDef, AssignLocal, If, Pass, FuncDef). It would
-  be restricted to `unroll_range`, so that it is fully resolved at blue time.
-- `unroll_range`, from the dataclass note (not in the repo yet; Antonio is
-  working on unroll loops).
-- a way to bind a name computed at blue time. `locals()[name] = v` is the
-  Python spelling; since `name` is blue in each unrolled iteration, ClassFrame
-  can declare the local statically.
+Today `__extra_fields__` is a special local of `ClassFrame`: it is declared
+with type `interp_dict[str, type]`, so that its assignment is typechecked, and
+`ClassFrame.run` moves it into the class body, where the struct machinery
+turns it into fields. `__extra_methods__` would work the same way:
 
-Assigning a method template re-evaluates its `def` in the new class scope, so
-`self` becomes the generated class and not the user class. A plain copy of the
-function would keep `self` typed as the user class.
+  - it is declared as an `interp_dict[str, <method>]` and typechecked at the
+    assignment;
+  - its entries are merged into the class namespace when the class is created,
+    as if the `def`s were written in the body;
+  - a name defined both explicitly and in `__extra_methods__` is an error.
 
-Alternative without a loop, by analogy with `__extra_fields__`:
-`__extra_methods__ = methods`. Less general, but no new statement in class
-bodies.
+Compared to the fields, there is one subtlety. The values of
+`cls.__methods__` are method *templates*: the `self` of the user's
+`def norm2(self)` is not bound to any class yet. When they are merged,
+each template is instantiated in the new class scope, so that `self` is
+`_heap` and not the user class. Copying the functions as they are would keep
+`self` typed as the user class.
+
+What this needs:
+
+  - `cls.__methods__`: an ordered `{name: method template}` dict, next to
+    `cls.__annotations__`;
+  - `__extra_methods__` handling in `ClassFrame` and in the struct class
+    creation (a few lines, mirroring `__extra_fields__`).
+
+What this does not need: any new statement in class bodies, `unroll_range`, or
+the blue `for` loops that Antonio is working on. So it is independent from
+them.
+
+The limit is that it is all or nothing: every user method is copied as is.
+The decorator cannot skip, rename or wrap a method (for example to add a
+check before `__init__`). A more general alternative, an unrolled `for` loop
+in the class body, is left to discuss.
