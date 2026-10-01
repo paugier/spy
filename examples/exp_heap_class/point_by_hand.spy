@@ -1,0 +1,77 @@
+"""
+Experiment: heap-allocated classes, written by hand.
+
+This is what a future `@heap class Point` should generate: a `Point_data`
+struct holding the fields, and a `Point` struct wrapping a `gc_ptr[Point_data]`.
+Since `Point` is a struct holding one pointer, copying it copies the pointer:
+that is what gives reference semantics.
+
+Needs the `__getattribute__` -> default lookup fallback (see README.md).
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, gc_alloc
+
+
+@struct
+class Point_data:
+    x: i32
+    y: i32
+
+
+@struct
+class Point:
+    __ll__: gc_ptr[Point_data]
+
+    @blue.metafunc
+    def __getattribute__(m_self, m_name):
+        name = m_name.blueval
+        if name == "x":
+            def get_x(self: Point, attr: str) -> i32:
+                return self.__ll__.x
+            return OpSpec(get_x)
+        if name == "y":
+            def get_y(self: Point, attr: str) -> i32:
+                return self.__ll__.y
+            return OpSpec(get_y)
+        return OpSpec.NULL
+
+    @blue.metafunc
+    def __setattr__(m_self, m_name, m_v):
+        name = m_name.blueval
+        if name == "x":
+            def set_x(self: Point, attr: str, v: i32) -> None:
+                self.__ll__.x = v
+            return OpSpec(set_x)
+        if name == "y":
+            def set_y(self: Point, attr: str, v: i32) -> None:
+                self.__ll__.y = v
+            return OpSpec(set_y)
+        return OpSpec.NULL
+
+    def __new__(x: i32, y: i32) -> Point:
+        self = Point.__make__(gc_alloc[Point_data](1))
+        self.__init__(x, y)
+        return self
+
+    # user code
+    def __init__(self, x: i32, y: i32) -> None:
+        self.x = x
+        self.y = y
+
+    def norm2(self) -> i32:
+        return self.x * self.x + self.y * self.y
+
+
+def main() -> None:
+    p = Point(3, 4)
+    print(p.norm2())
+    p.x = 10
+    print(p.x)
+
+    # reference semantics: q and p are the same object
+    q = p
+    q.y = 99
+    print(p.y)
+    print(p.__ll__ == q.__ll__)
+    print(p.__ll__ == Point(10, 99).__ll__)

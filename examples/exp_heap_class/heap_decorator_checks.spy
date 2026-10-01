@@ -1,0 +1,21 @@
+# Functions called by test_heap_decorator.py.
+
+from point_heap import Point
+
+
+def construct_and_method() -> i32:
+    p = Point(3, 4)
+    return p.norm2()
+
+
+def aliasing() -> i32:
+    p = Point(1, 2)
+    q = p
+    q.y = 99
+    return p.y
+
+
+def identity() -> bool:
+    p = Point(1, 2)
+    q = p
+    return p is q and not (p is Point(1, 2))
