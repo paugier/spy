@@ -1,0 +1,55 @@
+# Functions called by test_heap_by_hand.py.
+
+from point_by_hand import Point
+
+
+def construct_and_method() -> i32:
+    p = Point(3, 4)
+    return p.norm2()
+
+
+def getattr_setattr() -> i32:
+    p = Point(3, 4)
+    p.x = 10
+    return p.x * 100 + p.y
+
+
+def aliasing() -> i32:
+    # the whole point of heap classes: `q = p` does NOT copy the data
+    p = Point(1, 2)
+    q = p
+    q.y = 99
+    return p.y
+
+
+def move_right(p: Point) -> None:
+    p.x = p.x + 1
+
+
+def mutation_through_call() -> i32:
+    p = Point(1, 2)
+    move_right(p)
+    move_right(p)
+    return p.x
+
+
+def independent_instances() -> i32:
+    p = Point(1, 2)
+    q = Point(1, 2)
+    q.x = 50
+    return p.x
+
+
+def same_ll(p: Point, q: Point) -> bool:
+    # `is` is not available yet (see test_heap_decorator.py), but identity can
+    # be spelled by comparing the underlying pointers
+    return p.__ll__ == q.__ll__
+
+
+def identity_same() -> bool:
+    p = Point(1, 2)
+    return same_ll(p, p)
+
+
+def identity_different() -> bool:
+    return same_ll(Point(1, 2), Point(1, 2))

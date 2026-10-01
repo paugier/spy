@@ -1,0 +1,20 @@
+"""
+User code: this is all that a user of `@heap` has to write.
+
+DOES NOT RUN YET, see heap_decorator.spy.
+"""
+
+from heap_decorator import heap
+
+
+@heap
+class Point:
+    x: i32
+    y: i32
+
+    def __init__(self, x: i32, y: i32) -> None:
+        self.x = x
+        self.y = y
+
+    def norm2(self) -> i32:
+        return self.x * self.x + self.y * self.y

@@ -33,6 +33,9 @@ def w_GETATTR(vm: "SPyVM", wam_obj: W_MetaArg, wam_name: W_MetaArg) -> W_OpImpl:
         w_opspec = W_OpSpec(OP.w_dynamic_getattr)
     elif w_getattribute := w_T.lookup_func(vm, f"__getattribute__"):
         w_opspec = vm.fast_metacall(w_getattribute, [wam_obj, wam_name])
+        if w_opspec.is_null():
+            # EXPERIMENT: like Python's object.__getattribute__ fallback
+            w_opspec = default_getattribute(vm, wam_obj, wam_name, name)
     else:
         w_opspec = default_getattribute(vm, wam_obj, wam_name, name)
 
