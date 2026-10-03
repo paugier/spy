@@ -1,0 +1,129 @@
+"""
+Experiment: `@protocol` in the phased style
+
+DOES NOT RUN. Read the header of heap.spy first: it describes the hooks
+(__transform__, __transform_subclass__, __define__, __after__) and the
+invented API (body.fields, body.methods, Method, @struct.define).
+
+Invented here, in addition:
+  @classbody class extra: ...   a class statement that does not create a type
+                                and gives a body value
+  body_a | body_b               merge two bodies (error on a duplicate name)
+  void, FnPtr, static_ptr, addr_of, ptr_cast   as in the page
+
+User code:
+
+    @protocol
+    class Shape:
+        def area(self) -> float: ...          # required method
+        def show(self) -> None:               # default method
+            print(self.area())
+
+    @heap
+    class Circle(Shape):    # explicit: Circle receives `show` (hook of Shape)
+        r: float
+        ...
+
+    @heap
+    class Rect:             # implicit: conversion to Shape builds the table
+        ...                 # for (Shape, Rect); Rect(...).show() does not exist
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, ptr_cast
+
+
+@struct
+class protocol:
+    @blue
+    def __define__(cls, body):
+        methods = body.methods  # required AND default methods: both get a slot
+
+        # --- blue helpers: one function generated per method (blue loops, so
+        # no unroll is needed) -------------------------------------------------
+
+        @blue
+        def make_dispatcher(name, m):
+            # what a call on a protocol value does: s.area() -> table lookup
+            def dispatch(self: cls, *args: tuple[*m.argtypes]) -> m.restype:
+                return getattr(self.vtable, name)(self.data, *args)
+
+            return dispatch
+
+        @blue
+        def impl_of(Concrete, name, m):
+            # the function that fills the slot `name` for Concrete
+            if hasattr(Concrete, name):
+                return getattr(Concrete, name)
+            if not m.is_required:
+                # implicit conformance
+                return m.bind(Concrete)
+            raise TypeError("missing required method: " + name)
+
+        @blue
+        def make_thunk(Concrete, name, m):
+            impl = impl_of(Concrete, name, m)
+
+            # the adapter: gets the type back from the erased pointer
+            def thunk(data: gc_ptr[void], *args: tuple[*m.argtypes]) -> m.restype:
+                return impl(Concrete.__unerase__(data), *args)
+
+            return thunk
+
+        @blue.generic
+        def vtable_for(Concrete):
+            # one constant table per pair (cls, Concrete), created on first use
+            thunks = []
+            for name, m in methods.items():
+                thunks.append(make_thunk(Concrete, name, m))
+            return VTable.__make__(*thunks)
+
+        slots = {}
+        dispatchers = {}
+        for name, m in methods.items():
+            slots[name] = FnPtr[[gc_ptr[void], *m.argtypes], m.restype]
+            dispatchers[name] = make_dispatcher(name, m)
+
+        # --- the types. `cls` first, then VTable (see heap.spy) ---------------
+
+        @struct.define(cls)
+        class _:
+            data: gc_ptr[void]  # word 1: the object, type erased
+            vtable: static_ptr[VTable]  # word 2: its table of methods
+            __extra_methods__ = dispatchers
+
+            @blue.metafunc
+            def __convert_from__(m_expT, m_gotT, m_obj):
+                Concrete = m_gotT.blueval
+                if not hasattr(Concrete, "__erase__"):
+                    # not a heap class (i32, a value struct...): cannot be
+                    # erased, so this protocol cannot receive it
+                    return OpSpec.NULL
+                table = vtable_for[Concrete]  # raises if a method is missing
+
+                def conv(obj: Concrete) -> cls:
+                    return cls.__make__(obj.__erase__(), addr_of(table))
+
+                return OpSpec(conv, [m_obj])
+
+            # Explicit conformance: `class Circle(Shape)`. Called by the
+            # compiler in phase 1, before Circle is defined.
+            @blue
+            def __transform_subclass__(sub_cls, sub_body):
+                missing = {}
+                for name, m in methods.items():
+                    if name in sub_body.methods:
+                        continue  # the class wins
+                    if m.is_required:
+                        raise TypeError("missing required method: " + name)
+                    missing[name] = m
+
+                @classbody
+                class extra:
+                    __extra_methods__ = missing  # Methods: bound to sub_cls later
+
+                return sub_body | extra
+
+        @struct
+        class VTable:
+            __extra_fields__ = slots

@@ -1,0 +1,109 @@
+"""
+Experiment: `@dataclass` in the phased style, as a pure *transformer*: it
+never defines a type. It adds methods to the body, and whoever defines the
+type (the default struct definer, or `@heap`) does the rest.
+
+DOES NOT RUN. Read the header of heap.spy first (hooks, invented API).
+
+Invented here, in addition:
+  @classbody class extra: ...     a class statement that gives a body value
+  body_a | body_b                 merge two bodies
+  cls.__name__                    the name of the type
+  hasattr(cls, "__from_fields__") the contract with definers, see below
+
+User code. The same modifier gives a value type and a heap class:
+
+    @dataclass
+    class Vec:             # no definer: the default struct definer -> a value
+        x: f64
+        y: f64
+
+    @heap
+    @dataclass
+    class Particle:        # heap-allocated; the two decorators can be swapped:
+        x: f64             # all transformers run before the (single) definer
+        y: f64
+
+    Vec(1.0, 2.0) == Vec(1.0, 2.0)     # True
+    repr(Particle(1.0, 2.0))           # "Particle(x=1.0, y=2.0)"
+
+Rules, the same as for protocols ("the class wins"): a method is generated
+only if the body does not already have it. A user-written `__init__` is kept
+(as in Python), so no `__new__` is generated in that case.
+
+Why not generate `__init__`, as Python does? A plain struct has no in-place
+initialization: its constructor is `__new__ = __make__`, and `__make__` cannot
+be written by the user (spy/vm/struct.py). So the generated `__new__` builds
+the object through a hook of the definer:
+  - `cls.__from_fields__(*values)` if the definer provides it (`@heap` does),
+  - `cls.__make__(*values)` otherwise (plain struct).
+`hasattr(cls, ...)` is asked when the constructor is *used*, not when the
+transformer runs: at the time of the transformer, `cls` is declared but not
+yet defined.
+
+Not handled: default values (`x: f64 = 0.0`). ClassFrame rejects them today
+("default values in fields not supported yet"), so the body would first need
+something like `body.defaults`.
+"""
+
+from operator import OpSpec
+from __spy__ import unroll_range
+
+
+@struct
+class dataclass:
+    @blue
+    def __transform__(cls, body):
+        fields = body.fields
+        names = (*fields.keys(),)
+        types = (*fields.values(),)
+        N = len(names)
+        cname = cls.__name__
+
+        # In this class body, ALWAYS annotate `self: cls`. An unannotated
+        # `self` would be typed with the class `extra` itself.
+        @classbody
+        class extra:
+            if "__new__" not in body.methods and "__init__" not in body.methods:
+
+                @blue.metafunc
+                def __new__(*m_args):
+                    # could raise TypeError here if m_args.types != types
+                    if hasattr(cls, "__from_fields__"):
+                        make = cls.__from_fields__
+                    else:
+                        make = cls.__make__
+
+                    def new(*args: tuple[*types]) -> cls:
+                        return make(*args)
+
+                    return OpSpec(new)
+
+            if "__eq__" not in body.methods:
+
+                @blue.metafunc
+                def __eq__(m_self, m_other):
+                    def impl(self: cls, other: cls) -> bool:
+                        ok = True
+                        for i in unroll_range(N):
+                            if getattr(self, names[i]) != getattr(other, names[i]):
+                                ok = False
+                        return ok
+
+                    return OpSpec(impl, [m_self, m_other])
+
+            if "__repr__" not in body.methods:
+
+                @blue.metafunc
+                def __repr__(m_self):
+                    def impl(self: cls) -> str:
+                        s = cname + "("
+                        for i in unroll_range(N):
+                            if i > 0:
+                                s = s + ", "
+                            s = s + names[i] + "=" + repr(getattr(self, names[i]))
+                        return s + ")"
+
+                    return OpSpec(impl, [m_self])
+
+        return body | extra
