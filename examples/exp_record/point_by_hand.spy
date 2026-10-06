@@ -1,7 +1,7 @@
 """
 Experiment: heap-allocated classes, written by hand.
 
-This is what a future `@heap class Point` should generate: a `Point_data`
+This is what a future `class Point(metaclass=Record)` should generate: a `Point_data`
 struct holding the fields, and a `Point` struct wrapping a `gc_ptr[Point_data]`.
 Since `Point` is a struct holding one pointer, copying it copies the pointer:
 that is what gives reference semantics.

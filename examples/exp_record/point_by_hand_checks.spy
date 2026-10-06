@@ -41,7 +41,7 @@ def independent_instances() -> i32:
 
 
 def same_ll(p: Point, q: Point) -> bool:
-    # `is` is not available yet (see test_heap_decorator.py), but identity can
+    # `is` is not available yet (see test_record.py), but identity can
     # be spelled by comparing the underlying pointers
     return p.__ll__ == q.__ll__
 

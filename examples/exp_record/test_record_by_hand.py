@@ -1,6 +1,6 @@
 # mypy: ignore-errors
 """
-Heap-allocated classes, part 1: the code that `@heap` is supposed to generate,
+Heap-allocated classes, part 1: the code that `Record` is supposed to generate,
 written by hand in point_by_hand.spy.
 
 point_by_hand_checks.spy imports `Point` from point_by_hand and defines the
@@ -15,7 +15,7 @@ HERE = Path(__file__).parent
 CHECKS = (HERE / "point_by_hand_checks.spy").read_text()
 
 
-class TestHeapClassByHand(CompilerTest):
+class TestRecordByHand(CompilerTest):
     def compile_checks(self):
         # make `import point_by_hand` work
         self.vm.path.append(str(HERE))

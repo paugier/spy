@@ -1,14 +1,13 @@
 """
-User code: this is all that a user of `@heap` has to write.
+User code: this is all that a user of `Record` has to write.
 
-DOES NOT RUN YET, see heap_decorator.spy.
+DOES NOT RUN YET, see stdlib/metaclasses/record.spy and README.md.
 """
 
-from heap_decorator import heap
+from record import Record
 
 
-@heap
-class Point:
+class Point(metaclass=Record):
     x: i32
     y: i32
 

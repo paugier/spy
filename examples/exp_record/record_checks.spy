@@ -1,0 +1,36 @@
+# Functions called by test_record.py.
+
+from point_record import Point
+from point_record_generated import Vec
+
+
+def construct_and_method() -> i32:
+    p = Point(3, 4)
+    return p.norm2()
+
+
+def aliasing() -> i32:
+    p = Point(1, 2)
+    q = p
+    q.y = 99
+    return p.y
+
+
+def identity() -> bool:
+    p = Point(1, 2)
+    q = p
+    return p is q and not (p is Point(1, 2))
+
+
+def generated_init() -> i32:
+    v = Vec(3, 4)
+    return v.x * 10 + v.y
+
+
+def generated_eq() -> bool:
+    # equality of the fields, not identity
+    return Vec(1, 2) == Vec(1, 2) and Vec(1, 2) != Vec(1, 3)
+
+
+def generated_repr() -> str:
+    return repr(Vec(1, 2))

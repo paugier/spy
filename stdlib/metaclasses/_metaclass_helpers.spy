@@ -1,0 +1,244 @@
+"""
+Helper functions shared by the metaclasses of this directory.
+
+DOES NOT RUN. Read stdlib/metaclasses/README.md first: it lists the invented
+API used here and the features of metaclasses.md (section 7) that are needed.
+
+A metaclass is the only thing that defines a type. These functions are not
+transformers: they are ordinary blue functions that a metaclass calls inside
+its `define_from_classbody`, either to complete a `ClassBody` (add_*) or to
+add the wrapper machinery of a heap class (add_field_accessors, ...).
+
+Rule used everywhere ("the class wins"): a method is generated only if the body
+does not already have it.
+
+Invented API, in addition to the one of metaclasses.md (section 5):
+  body.attrs                  ordered {name: value}: the class attributes that are
+                              neither fields nor functions (a nested `class`
+                              statement, a constant)
+  body.add_attr(name, v)      add a class attribute (a blue value)
+  Method                      what `body.methods` contains: a function object with
+                              .argtypes (without self), .restype, .is_required
+                              (the body is `...`) and .bind(T), which gives the
+                              same function with `self` typed as T
+  T.__fields__                ordered {name: type} of the *logical* fields of any
+                              type (for a Record: `x`, `y`, not `__ll__`)
+  void, ptr_cast              as in inheritance-variants-protocols.md
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, ptr_cast
+from __spy__ import unroll_range
+
+
+# --- methods generated from the fields ------------------------------------------
+
+
+@blue
+def add_init(cls, body, fields):
+    """
+    `__init__` for a type whose objects are initialized in place (a heap class).
+    A value struct cannot have it: it is immutable and `self` is a copy.
+    """
+    if "__init__" in body.methods or "__new__" in body.methods:
+        return
+    names = (*fields.keys(),)
+    types = (*fields.values(),)
+    N = len(names)
+
+    def __init__(self: cls, *args: *types) -> None:
+        for i in unroll_range(N):
+            setattr(self, names[i], args[i])
+
+    body.add_method("__init__", __init__)
+
+
+@blue
+def add_eq_ne(cls, body, fields):
+    """
+    Field-by-field `__eq__` and `__ne__`.
+
+    Both are needed: as soon as the body has an `__eq__` or an `__ne__`, the
+    compiler does not generate the other one (see W_StructType).
+    """
+    names = (*fields.keys(),)
+    N = len(names)
+
+    if "__eq__" not in body.methods:
+
+        def __eq__(self: cls, other: cls) -> bool:
+            for i in unroll_range(N):
+                if getattr(self, names[i]) != getattr(other, names[i]):
+                    return False
+            return True
+
+        body.add_method("__eq__", __eq__)
+
+    if "__ne__" not in body.methods:
+
+        def __ne__(self: cls, other: cls) -> bool:
+            return not (self == other)
+
+        body.add_method("__ne__", __ne__)
+
+
+@blue
+def add_repr(cls, body, fields):
+    if "__repr__" in body.methods:
+        return
+    names = (*fields.keys(),)
+    N = len(names)
+    cname = cls.__name__
+
+    def __repr__(self: cls) -> str:
+        s = cname + "("
+        for i in unroll_range(N):
+            if i > 0:
+                s = s + ", "
+            s = s + names[i] + "=" + repr(getattr(self, names[i]))
+        return s + ")"
+
+    body.add_method("__repr__", __repr__)
+
+
+@blue
+def add_generated_methods(cls, body, fields):
+    """
+    What Python's @dataclass generates, for a heap class. `fields` is passed
+    explicitly (and is not `body.fields`) because DataClass also needs the fields
+    of the bases.
+    """
+    add_init(cls, body, fields)
+    add_eq_ne(cls, body, fields)
+    add_repr(cls, body, fields)
+
+
+# --- the machinery of a heap class: wrapper around a pointer ---------------------
+
+
+@blue
+def add_field_accessors(wrapper, cls, fields, base=None):
+    """
+    `p.x` and `p.x = v` for a wrapper `{__ll__: gc_ptr[Data]}`: they go through
+    `__ll__`. `fields` are the fields stored in `Data`. If `base` is given, the
+    fields of the base class are reached through a free upcast.
+
+    A name which is not a field gives OpSpec.NULL: default lookup (methods, and
+    `__ll__` itself).
+    """
+    all_base = base.__info__["all_fields"] if base is not None else {}
+
+    def up(self: cls) -> base:
+        # the base class sees the same address: its own data comes first
+        BObj = base.__info__["obj"]
+        return base.__make__(ptr_cast[gc_ptr[BObj]](self.__ll__))
+
+    @blue.metafunc
+    def __getattribute__(m_self, m_name):
+        name = m_name.blueval
+        if name in fields:
+            T = fields[name]
+
+            def get(self: cls, attr: str) -> T:
+                return getattr(self.__ll__, name)
+
+            return OpSpec(get)
+        if name in all_base:
+            T = all_base[name]
+
+            def get_inherited(self: cls, attr: str) -> T:
+                return getattr(up(self), name)
+
+            return OpSpec(get_inherited)
+        return OpSpec.NULL
+
+    @blue.metafunc
+    def __setattr__(m_self, m_name, m_v):
+        name = m_name.blueval
+        if name in fields:
+            T = fields[name]
+
+            def set(self: cls, attr: str, v: T) -> None:
+                setattr(self.__ll__, name, v)
+
+            return OpSpec(set)
+        if name in all_base:
+            T = all_base[name]
+
+            def set_inherited(self: cls, attr: str, v: T) -> None:
+                setattr(up(self), name, v)
+
+            return OpSpec(set_inherited)
+        return OpSpec.NULL
+
+    wrapper.add_method("__getattribute__", __getattribute__)
+    wrapper.add_method("__setattr__", __setattr__)
+
+
+@blue
+def add_identity(wrapper, cls):
+    """`a is b` on heap objects: same pointer. (`is` is rejected on value types.)"""
+
+    @blue.metafunc
+    def __is__(m_self, m_other):
+        def impl(self: cls, other: cls) -> bool:
+            return self.__ll__ == other.__ll__
+
+        return OpSpec(impl, [m_self, m_other])
+
+    wrapper.add_method("__is__", __is__)
+
+
+@blue
+def add_erase_methods(wrapper, cls, Data):
+    """
+    The contract between a heap metaclass and Protocol: an object as an untyped
+    pointer and back. (`Circle_data` in inheritance-variants-protocols.md, 5.3,
+    appears without saying where it comes from: it is this.)
+    """
+
+    def __erase__(self: cls) -> gc_ptr[void]:
+        return ptr_cast[gc_ptr[void]](self.__ll__)
+
+    def __unerase__(p: gc_ptr[void]) -> cls:
+        return cls.__make__(ptr_cast[gc_ptr[Data]](p))
+
+    wrapper.add_method("__erase__", __erase__)
+    wrapper.add_method("__unerase__", __unerase__)
+
+
+# --- explicit conformance to protocols --------------------------------------------
+
+
+@blue
+def add_protocol_defaults(cls, body, fields, protocols):
+    """
+    `class Circle(metaclass=Record, implements=[Shape])`: check the required
+    methods and attributes of each protocol, and copy its default methods into
+    the body, bound to `cls`.
+
+    Why a keyword and not `class Circle(Shape)`: the rule of metaclasses.md,
+    section 3 ("the metaclass of a class with bases must be a subtype of the
+    metaclass of the bases") would reject it, since Record is not a subtype of
+    Protocol. See README.md.
+    """
+    added = {}
+    for P in protocols:
+        for name, T in P.__protocol_attrs__.items():
+            if name not in fields or fields[name] != T:
+                raise TypeError("missing required attribute: " + name)
+        for name, m in P.__protocol_methods__.items():
+            if name in body.methods and name not in added:
+                continue  # the class wins
+            if m.is_required:
+                raise TypeError("missing required method: " + name)
+            if name in added:
+                raise TypeError("default method inherited twice: " + name)
+            body.add_method(name, m.bind(cls))
+            added[name] = True
+
+
+@blue
+def add_class_info(wrapper, fields):
+    """What other metaclasses (Protocol, DataClass) read from a defined class."""
+    wrapper.add_attr("__fields__", fields)

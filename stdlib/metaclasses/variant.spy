@@ -1,0 +1,111 @@
+"""
+`Variant`: a closed set of cases (a sum type), stored as a tag and a union.
+
+DOES NOT RUN. Read README.md of this directory. The design is the one of
+inheritance-variants-protocols.md, section 4, by reference (Antonio's version).
+
+User code:
+
+    class Shape(metaclass=Variant):
+        class Circle:                      # nested class statements: M2.4
+            r: f64
+
+        class Rect:
+            w: f64
+            h: f64
+
+        def area(self) -> f64:
+            match self:                    # invented: match on a variant
+                case Shape.Circle(r):
+                    return r * r * 3.14159
+                case Shape.Rect(w, h):
+                    return w * h
+
+    a = Shape.Circle(1.0)                  # a constructor...
+    b = Shape.Rect(2.0, 3.0)               # ...both give a `Shape`
+
+The cases are the nested types of the body (`body.attrs`). The default metaclass
+of a nested class is StructType, so a case is a plain struct.
+
+The open question of the note ("what is `Shape.Circle` exactly?") has to be
+answered here, and the metaclass answers it with the least machinery: after the
+definition `Shape.Circle` is the *constructor* (a static method of the variant).
+The case type itself stays reachable as `Shape.__cases__["Circle"]`. For `match`,
+the metaclass offers the hooks that the compiler would use to lower it:
+
+    Shape.__tag__(self) -> i32              the tag
+    Shape.__tag_of__["Circle"]              the tag of a case (a blue constant)
+    Shape.__as_Circle__(self) -> Circle     the payload, as the case struct
+
+so that `case Shape.Circle(r)` becomes `if s.__tag__() == 0: r = s.__as_Circle__().r`.
+"""
+
+from unsafe import gc_ptr, gc_alloc
+
+
+class Variant(StructType):
+    def define_from_classbody(self, body):
+        cls = self
+        if body.fields:
+            raise TypeError("a variant has no fields of its own, only cases")
+        cases = {}
+        for name, value in body.attrs.items():
+            if isinstance(value, StructType):
+                cases[name] = value
+        if not cases:
+            raise TypeError("a variant needs at least one case")
+
+        Obj = StructType.declare(self.fqn.join("Object"))
+
+        wrapper = ClassBody()
+        wrapper.add_field("__ll__", gc_ptr[Obj])
+        wrapper.add_methods(body.methods)
+
+        tags = {}
+
+        @blue
+        def make_ctor(tag, name, Case):
+            case_types = (*Case.__fields__.values(),)
+
+            def ctor(*args: *case_types) -> cls:
+                obj = gc_alloc[Obj](1)
+                obj.discriminant = tag
+                # invented: a member of an ll_union is read and written by name
+                setattr(obj.payload, name, Case.__make__(*args))
+                return cls.__make__(obj)
+
+            return ctor
+
+        @blue
+        def make_as(name, Case):
+            def as_case(self: cls) -> Case:
+                return getattr(self.__ll__.payload, name)
+
+            return as_case
+
+        tag = 0
+        for name, Case in cases.items():
+            tags[name] = tag
+            wrapper.add_method(name, make_ctor(tag, name, Case))
+            wrapper.add_method("__as_" + name + "__", make_as(name, Case))
+            tag = tag + 1
+
+        def __tag__(self: cls) -> i32:
+            return self.__ll__.discriminant
+
+        wrapper.add_method("__tag__", __tag__)
+        wrapper.add_attr("__cases__", cases)
+        wrapper.add_attr("__tag_of__", tags)
+
+        # The wrapper is defined first (it only has a pointer to Obj), then the
+        # data. The payload is a union of the cases, which are already defined.
+        super().define_from_classbody(wrapper)
+
+        Obj.define_from_classbody(
+            ClassBody(
+                fields={
+                    "discriminant": i32,
+                    "payload": ll_union(cases),  # invented: {name: type} -> union
+                }
+            )
+        )

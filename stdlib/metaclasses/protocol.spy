@@ -1,0 +1,131 @@
+"""
+`Protocol`: structural interfaces, as a fat pointer (data pointer + vtable pointer).
+
+DOES NOT RUN. Read README.md of this directory. The design is the one of
+inheritance-variants-protocols.md, section 5 (5.8 and 5.9 included).
+
+User code:
+
+    class Shape(metaclass=Protocol):
+        density: f64                          # required attribute (5.9)
+
+        def area(self) -> f64: ...            # required method
+        def mass(self) -> f64:                # default method
+            return self.density * self.area()
+
+    class Circle(metaclass=Record, implements=[Shape]):   # explicit conformance
+        r: f64
+        density: f64
+        ...
+        def area(self) -> f64: ...            # Circle.mass comes from Shape
+
+    class Rect(metaclass=Record):             # implicit conformance
+        ...
+
+    def total_mass(s: Shape) -> f64:
+        return s.mass()                       # s.vtable.mass(s.data)
+
+    total_mass(Circle(...))                   # converts: builds (data, vtable)
+
+Differences with the note, all forced by the metaclass machinery:
+
+  - explicit conformance is `implements=[Shape]`, not `class Circle(Shape)`: the
+    rule "the metaclass of a class with bases is a subtype of the metaclass of the
+    bases" would reject a Record whose base is a Protocol (see README.md).
+  - the objects that can be converted are those of the metaclasses that provide
+    `__erase__` and `__unerase__` (Record, ClassMetaClass): that is the contract.
+    A value struct has neither, and the conversion is refused.
+  - the default methods have to be *rebound* for each class (`Method.bind`): the
+    ones of the protocol body are typed with `self: Shape` (the fat pointer).
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, static_ptr, ptr_cast, addr_of
+
+
+class Protocol(StructType):
+    def define_from_classbody(self, body):
+        cls = self
+        methods = body.methods  # required AND default methods: both get a slot
+        attrs = body.fields  # required attributes: they are NOT stored here
+
+        VTable = StructType.declare(self.fqn.join("VTable"))
+
+        # --- blue helpers: one function per method (blue loops: no unrolling) -----
+
+        @blue
+        def make_dispatcher(name, m):
+            # what a call on a protocol value does: s.area() -> table lookup
+            def dispatch(self: cls, *args: *m.argtypes) -> m.restype:
+                return getattr(self.vtable, name)(self.data, *args)
+
+            return dispatch
+
+        @blue
+        def impl_of(Concrete, name, m):
+            # the function that fills the slot `name` for Concrete
+            if hasattr(Concrete, name):
+                return getattr(Concrete, name)
+            if not m.is_required:
+                return m.bind(Concrete)  # implicit conformance: choice 2 of 5.8
+            raise TypeError("missing required method: " + name)
+
+        @blue
+        def make_thunk(Concrete, name, m):
+            impl = impl_of(Concrete, name, m)
+
+            # the adapter: gets the type back from the erased pointer
+            def thunk(data: gc_ptr[void], *args: *m.argtypes) -> m.restype:
+                return impl(Concrete.__unerase__(data), *args)
+
+            return thunk
+
+        @blue
+        def check_attrs(Concrete):
+            fs = Concrete.__fields__
+            for name, T in attrs.items():
+                if name not in fs or fs[name] != T:
+                    raise TypeError("missing required attribute: " + name)
+
+        @blue.generic
+        def vtable_for(Concrete):
+            # one constant table per pair (cls, Concrete), created on first use
+            check_attrs(Concrete)
+            thunks = []
+            for name, m in methods.items():
+                thunks.append(make_thunk(Concrete, name, m))
+            return VTable.__make__(*thunks)
+
+        slots = {}
+        dispatchers = {}
+        for name, m in methods.items():
+            slots[name] = FnPtr[[gc_ptr[void], *m.argtypes], m.restype]
+            dispatchers[name] = make_dispatcher(name, m)
+
+        # --- the types: the fat pointer first, then the table ---------------------
+        wrapper = ClassBody()
+        wrapper.add_field("data", gc_ptr[void])  # word 1: the object, type erased
+        wrapper.add_field("vtable", static_ptr[VTable])  # word 2: its table
+        wrapper.add_methods(dispatchers)
+
+        # what `implements=[...]` of the other metaclasses reads
+        wrapper.add_attr("__protocol_methods__", methods)
+        wrapper.add_attr("__protocol_attrs__", attrs)
+
+        @blue.metafunc
+        def __convert_from__(m_expT, m_gotT, m_obj):
+            Concrete = m_gotT.blueval
+            if not hasattr(Concrete, "__erase__"):
+                # a value struct, i32...: cannot be erased to a pointer
+                return OpSpec.NULL
+            table = vtable_for[Concrete]  # raises if something is missing
+
+            def conv(obj: Concrete) -> cls:
+                return cls.__make__(obj.__erase__(), addr_of(table))
+
+            return OpSpec(conv, [m_obj])
+
+        wrapper.add_method("__convert_from__", __convert_from__)
+
+        super().define_from_classbody(wrapper)
+        VTable.define_from_classbody(ClassBody(fields=slots))

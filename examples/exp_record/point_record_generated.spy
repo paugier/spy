@@ -1,0 +1,13 @@
+"""
+User code relying on the methods that `Record` generates from the fields: no
+`__init__`, no `__eq__`, no `__repr__`.
+
+DOES NOT RUN YET, see stdlib/metaclasses/record.spy and README.md.
+"""
+
+from record import Record
+
+
+class Vec(metaclass=Record):
+    x: i32
+    y: i32

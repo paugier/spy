@@ -1,0 +1,259 @@
+"""
+`ClassMetaClass`: heap-allocated classes with single inheritance and a vtable.
+
+DOES NOT RUN. Read README.md of this directory. The design is the one of
+inheritance-variants-protocols.md, section 3; the keyword `final` is the one of
+metaclasses.md, section 6.
+
+User code:
+
+    class Shape(metaclass=ClassMetaClass):
+        def area(self) -> f64:
+            raise NotImplementedError
+
+    class Circle(Shape, final=True):
+        r: f64
+
+        def __init__(self, r: f64) -> None:
+            self.r = r
+
+        def area(self) -> f64:
+            return 3.14159 * self.r * self.r
+
+    def total(c: Circle, s: Shape) -> f64:
+        return c.area() + s.area()    # direct call, then vtable call
+
+What is generated, for a class C (see the lowering in the note):
+
+    C                a struct {__ll__: gc_ptr[C::Object]}, the wrapper
+    C::Object        {_vtable, fields} for the root, {__parent__, fields} for a subclass
+    C::VTable        {__parent__, one slot per virtual method introduced by C}
+    C.area           the dispatcher: reads the vtable (a direct call if final)
+    C._area_impl     the method written by the user, under another name
+    thunk            per (class, method): casts the root pointer back, calls _impl
+
+Every method that does not start with `__` is virtual. All the slots of all the
+vtables of a hierarchy have the same kind of type: a function pointer taking a
+pointer to the *root* object.
+
+Information needed by the subclasses and by Protocol/DataClass is stored in the
+class attribute `__info__` (a blue dict): there is no field of the type for it.
+In particular `final` lives there (M2.3 of metaclasses.md is not needed for this
+metaclass, see README.md).
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, gc_alloc, static_ptr, ptr_cast, addr_of
+
+from _metaclass_helpers import (
+    add_field_accessors,
+    add_identity,
+    add_erase_methods,
+    add_protocol_defaults,
+    add_class_info,
+)
+
+
+@blue
+def check_override(name, base_sig, m):
+    _, argtypes, restype = base_sig
+    if m.argtypes != argtypes or m.restype != restype:
+        raise TypeError("incompatible override of " + name)
+
+
+class ClassMetaClass(StructType):
+    def define_from_classbody(self, body, final=False, implements=()):
+        cls = self
+        base = self.w_base
+        is_root = base is object  # invented: the w_base of a class without base
+        binfo = None if is_root else base.__info__
+
+        if not is_root:
+            if not isinstance(base, ClassMetaClass):
+                raise TypeError("the base of a ClassMetaClass class must be one too")
+            if binfo["final"]:
+                raise TypeError("cannot inherit from the final class " + base.__name__)
+
+        # --- fields -----------------------------------------------------------
+        fields = body.fields
+        base_fields = {} if is_root else binfo["all_fields"]
+        for name in fields:
+            if name in base_fields:
+                raise TypeError("field redeclared in a subclass: " + name)
+        all_fields = {**base_fields, **fields}
+
+        add_protocol_defaults(cls, body, all_fields, implements)
+
+        # --- virtual methods: every method without a dunder name -------------------
+        virtuals = {} if is_root else dict(binfo["virtuals"])  # name -> (intro, args, res)
+        impl_owner = {} if is_root else dict(binfo["impl_owner"])  # name -> class
+        own_virtual = {}
+        new_virtuals = []
+        for name, m in body.methods.items():
+            if name.startswith("__"):
+                continue
+            own_virtual[name] = m
+            if name in virtuals:
+                check_override(name, virtuals[name], m)
+            else:
+                virtuals[name] = (cls, m.argtypes, m.restype)
+                new_virtuals.append(name)
+            impl_owner[name] = cls
+
+        # A final class without base: nothing can ever need the vtable pointer
+        # (a final class with a base keeps it: it can be converted to its base).
+        needs_vtable = not (final and is_root)
+
+        # --- declare the types ----------------------------------------------------
+        Obj = StructType.declare(self.fqn.join("Object"))
+        VT = StructType.declare(self.fqn.join("VTable")) if needs_vtable else None
+        RootObj = Obj if is_root else binfo["root_obj"]
+
+        info = {
+            "obj": Obj,
+            "vt": VT,
+            "root_obj": RootObj,
+            "all_fields": all_fields,
+            "virtuals": virtuals,
+            "impl_owner": impl_owner,
+            "new_virtuals": (*new_virtuals,),
+            "final": final,
+            "chain": (cls,) if is_root else (*binfo["chain"], cls),
+        }
+
+        # --- the wrapper -----------------------------------------------------------
+        wrapper = ClassBody()
+        wrapper.add_field("__ll__", gc_ptr[Obj])
+        for name, m in body.methods.items():
+            if name in own_virtual:
+                wrapper.add_method("_" + name + "_impl", m)
+            else:
+                wrapper.add_method(name, m)
+        add_field_accessors(wrapper, cls, fields, base=None if is_root else base)
+        add_identity(wrapper, cls)
+        add_erase_methods(wrapper, cls, Obj)
+        add_class_info(wrapper, all_fields)
+        wrapper.add_attr("__info__", info)
+
+        # The dispatcher of each virtual method, including the inherited ones.
+        @blue
+        def make_dispatcher(name, intro, argtypes, restype):
+            if final:
+                owner = impl_owner[name]
+                OwnerObj = Obj if owner is cls else owner.__info__["obj"]
+                impl_name = "_" + name + "_impl"
+
+                def direct(self: cls, *args: *argtypes) -> restype:
+                    o = owner.__make__(ptr_cast[gc_ptr[OwnerObj]](self.__ll__))
+                    return getattr(owner, impl_name)(o, *args)
+
+                return direct
+
+            IntroVT = VT if intro is cls else intro.__info__["vt"]
+
+            def virtual(self: cls, *args: *argtypes) -> restype:
+                root = ptr_cast[gc_ptr[RootObj]](self.__ll__)
+                vt = ptr_cast[static_ptr[IntroVT]](root._vtable)
+                return getattr(vt, name)(root, *args)
+
+            return virtual
+
+        for name, sig in virtuals.items():
+            wrapper.add_method(name, make_dispatcher(name, sig[0], sig[1], sig[2]))
+
+        # --- the table of cls, built on first use (the class is defined then) ------
+        @blue
+        def make_thunk(D, name):
+            DObj = D.__info__["obj"]
+            argtypes = virtuals[name][1]
+            restype = virtuals[name][2]
+            impl_name = "_" + name + "_impl"
+
+            def thunk(obj: gc_ptr[RootObj], *args: *argtypes) -> restype:
+                d = D.__make__(ptr_cast[gc_ptr[DObj]](obj))
+                return getattr(D, impl_name)(d, *args)
+
+            return thunk
+
+        # `Self` is a dummy parameter: a generic without parameter would be called
+        # as `vtable[]`, which Python's parser rejects (README.md, finding 7)
+        @blue.generic
+        def vtable(Self):
+            value = None
+            for K in Self.__info__["chain"]:
+                slots = (*[make_thunk(impl_owner[n], n) for n in K.__info__["new_virtuals"]],)
+                VT_K = K.__info__["vt"]
+                if value is None:
+                    value = VT_K.__make__(*slots)
+                else:
+                    value = VT_K.__make__(value, *slots)
+            return value
+
+        # --- construction ---------------------------------------------------------
+        if "__new__" not in body.methods:
+
+            @blue.metafunc
+            def __new__(*args_m):
+                arg_types = args_m.types
+
+                if needs_vtable:
+                    table = vtable[cls]
+
+                    def new(*args: *arg_types) -> cls:
+                        self = cls.__make__(gc_alloc[Obj](1))
+                        # before __init__, so that a virtual call made from an
+                        # __init__ already works
+                        root = ptr_cast[gc_ptr[RootObj]](self.__ll__)
+                        root._vtable = addr_of(table)
+                        self.__init__(*args)
+                        return self
+
+                else:
+
+                    def new(*args: *arg_types) -> cls:
+                        self = cls.__make__(gc_alloc[Obj](1))
+                        self.__init__(*args)
+                        return self
+
+                return OpSpec(new)
+
+            wrapper.add_method("__new__", __new__)
+
+        # A subclass is accepted where `cls` is expected: free upcast.
+        @blue.metafunc
+        def __convert_from__(m_expT, m_gotT, m_obj):
+            Sub = m_gotT.blueval
+            if Sub is cls or not issubclass(Sub, cls):  # invented: walks w_base
+                return OpSpec.NULL
+
+            def up(o: Sub) -> cls:
+                return cls.__make__(ptr_cast[gc_ptr[Obj]](o.__ll__))
+
+            return OpSpec(up, [m_obj])
+
+        wrapper.add_method("__convert_from__", __convert_from__)
+
+        # --- define: the wrapper, then the table, then the data -------------------
+        # The wrapper only needs a pointer to Obj. The table needs the wrapper
+        # (the slots can mention it) and the table of the base. Obj needs the
+        # table pointer, the data of the base and the types of the fields.
+        super().define_from_classbody(wrapper)
+
+        if needs_vtable:
+            vt_body = ClassBody()
+            if not is_root:
+                vt_body.add_field("__parent__", binfo["vt"])
+            for name in new_virtuals:
+                _, argtypes, restype = virtuals[name]
+                vt_body.add_field(name, FnPtr[[gc_ptr[RootObj], *argtypes], restype])
+            VT.define_from_classbody(vt_body)
+
+        obj_body = ClassBody()
+        if is_root:
+            if needs_vtable:
+                obj_body.add_field("_vtable", static_ptr[VT])
+        else:
+            obj_body.add_field("__parent__", binfo["obj"])
+        for name, T in fields.items():
+            obj_body.add_field(name, T)
+        Obj.define_from_classbody(obj_body)

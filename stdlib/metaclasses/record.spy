@@ -1,0 +1,80 @@
+"""
+`Record`: a heap-allocated class, written as a metaclass.
+
+DOES NOT RUN. Read README.md of this directory (invented API, features needed,
+findings). The reference is metaclasses.md, section 4.
+
+User code:
+
+    class Point(metaclass=Record):
+        x: i32
+        y: i32
+
+    p = Point(1, 2)      # __init__ generated from the fields
+    q = p                # same object: copying a Point copies a pointer
+    q.y = 99             # p.y == 99
+    p == Point(1, 99)    # True: __eq__ generated, field by field
+    p is q               # True
+    repr(p)              # "Point(x=1, y=99)"
+
+What this file adds to the simplified Record of section 4: the generated
+`__init__`, `__eq__`, `__ne__` and `__repr__` (helpers), `__is__` (without it
+`p is q` is rejected), the `__erase__` / `__unerase__` contract used by Protocol,
+and the keyword `implements` (explicit conformance to protocols).
+"""
+
+from operator import OpSpec
+from unsafe import gc_ptr, gc_alloc
+
+from _metaclass_helpers import (
+    add_generated_methods,
+    add_field_accessors,
+    add_identity,
+    add_erase_methods,
+    add_protocol_defaults,
+    add_class_info,
+)
+
+
+class Record(StructType):
+    def define_from_classbody(self, body, implements=()):
+        cls = self  # the type being defined: the wrapper
+        fields = body.fields  # {"x": i32, "y": i32}
+
+        # 1. Declare the data struct. It only has a name for now.
+        Data = StructType.declare(self.fqn.join("Data"))
+
+        # 2. Complete the user's body, then copy it into the wrapper's body.
+        # The user's methods already have `self: cls`, and `cls` is the wrapper.
+        add_protocol_defaults(cls, body, fields, implements)
+        add_generated_methods(cls, body, fields)
+
+        wrapper = ClassBody()
+        wrapper.add_field("__ll__", gc_ptr[Data])
+        wrapper.add_methods(body.methods)
+        add_field_accessors(wrapper, cls, fields)
+        add_identity(wrapper, cls)
+        add_erase_methods(wrapper, cls, Data)
+        add_class_info(wrapper, fields)
+
+        # "The class wins": a __new__ written by the user is kept.
+        if "__new__" not in body.methods:
+
+            @blue.metafunc
+            def __new__(*args_m):
+                arg_types = args_m.types
+
+                def new(*args: *arg_types) -> cls:
+                    self = cls.__make__(gc_alloc[Data](1))
+                    self.__init__(*args)
+                    return self
+
+                return OpSpec(new)
+
+            wrapper.add_method("__new__", __new__)
+
+        super().define_from_classbody(wrapper)
+
+        # 3. Define the data struct, now that the wrapper is defined. Data may
+        # have a field of the type of the wrapper (a linked list node).
+        Data.define_from_classbody(ClassBody(fields=fields))

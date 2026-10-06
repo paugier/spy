@@ -1,0 +1,46 @@
+"""
+`DataClass`: `ClassMetaClass` plus the methods that Python's @dataclass generates.
+Optional: it exists only to port Python code that uses `@dataclass` with
+inheritance (Antonio thinks dataclasses should not support it).
+
+DOES NOT RUN. Read README.md of this directory.
+
+User code:
+
+    class Base(metaclass=DataClass):
+        a: i32
+
+    class Child(Base):
+        b: i32
+
+    Child(1, 2) == Child(1, 2)      # True
+    repr(Child(1, 2))               # "Child(a=1, b=2)"
+
+The hard part, as metaclasses.md says: the generated methods of `Child` include
+the fields of `Base`. They are read from `Base.__info__["all_fields"]`, a class
+attribute set by ClassMetaClass; the inherited fields are then reached through
+the accessors of ClassMetaClass (free upcast).
+
+The metaclass of `Child` is found from its base (DataClass), so `Child` needs no
+`metaclass=`.
+"""
+
+from _metaclass_helpers import add_generated_methods, add_protocol_defaults
+from class_metaclass import ClassMetaClass
+
+
+class DataClass(ClassMetaClass):
+    def define_from_classbody(self, body, final=False, implements=()):
+        cls = self
+        base = self.w_base
+        base_fields = {} if base is object else base.__info__["all_fields"]
+        all_fields = {**base_fields, **body.fields}
+
+        # protocol defaults first: "the class wins" also holds against generated
+        # methods, but a protocol default wins over a generated one only if the
+        # protocol is explicit, which is the point of `implements`
+        add_protocol_defaults(cls, body, all_fields, implements)
+        add_generated_methods(cls, body, all_fields)
+
+        # implements=() because already done above
+        super().define_from_classbody(body, final=final)
