@@ -1,77 +1,123 @@
 """
-Experiment: heap-allocated classes, written by hand.
+The code that `class Point(metaclass=Record)` (see point_record.spy) generates,
+written by hand.
 
-This is what a future `class Point(metaclass=Record)` should generate: a `Point_data`
-struct holding the fields, and a `Point` struct wrapping a `gc_ptr[Point_data]`.
-Since `Point` is a struct holding one pointer, copying it copies the pointer:
-that is what gives reference semantics.
+It is ordinary `@struct` classes and functions, with no metaclass. Compared to what
+stdlib/metaclasses/record.spy really produces, it has no support for protocols (no
+`__erase__`, no `__unerase__`, no class info).
 
-Needs the `__getattribute__` -> default lookup fallback (see README.md).
+DOES NOT RUN YET, see README.md. point_simple.spy is a version that runs.
 """
 
 from operator import OpSpec
 from unsafe import gc_ptr, gc_alloc
 
 
-@struct
-class Point_data:
-    x: i32
-    y: i32
+@blue
+def make_Point():
+    fields = {"x": i32, "y": i32}
+    cname = "Point"
+
+    names = (*fields.keys(),)
+    types = (*fields.values(),)
+    N = len(names)
+
+    @struct
+    class cls:
+        __ll__: gc_ptr[Data]
+
+        # The following methods are generated from the fields, since the user wrote none
+        # of them.
+
+        def __init__(self: cls, *args: *types) -> None:
+            for i in unroll_range(N):
+                setattr(self, names[i], args[i])
+
+        def __eq__(self: cls, other: cls) -> bool:
+            for i in unroll_range(N):
+                if getattr(self, names[i]) != getattr(other, names[i]):
+                    return False
+            return True
+
+        def __ne__(self: cls, other: cls) -> bool:
+            return not (self == other)
+
+        @blue.metafunc
+        def __getattribute__(m_self, m_name):
+            name = m_name.blueval
+            if name in fields:
+                T = fields[name]
+
+                def get(self: cls, attr: str) -> T:
+                    return getattr(self.__ll__, name)
+
+                return OpSpec(get)
+            if name in all_base:
+                T = all_base[name]
+
+                def get_inherited(self: cls, attr: str) -> T:
+                    return getattr(up(self), name)
+
+                return OpSpec(get_inherited)
+            return OpSpec.NULL
+
+        @blue.metafunc
+        def __setattr__(m_self, m_name, m_v):
+            name = m_name.blueval
+            if name in fields:
+                T = fields[name]
+
+                def set(self: cls, attr: str, v: T) -> None:
+                    setattr(self.__ll__, name, v)
+
+                return OpSpec(set)
+            if name in all_base:
+                T = all_base[name]
+
+                def set_inherited(self: cls, attr: str, v: T) -> None:
+                    setattr(up(self), name, v)
+
+                return OpSpec(set_inherited)
+            return OpSpec.NULL
+
+        @blue.metafunc
+        def __new__(*args_m):
+            arg_types = args_m.types
+
+            def new(*args: *arg_types) -> cls:
+                self = cls.__make__(gc_alloc[Data](1))
+                self.__init__(*args)
+                return self
+
+            return OpSpec(new)
+
+        def __repr__(self) -> str:
+            s = cname + "("
+            for i in unroll_range(N):
+                if i > 0:
+                    s = s + ", "
+                s = s + names[i] + "=" + repr(getattr(self, names[i]))
+            return s + ")"
+
+        # `a is b`: two variables are the same object when they hold the same address.
+        @blue.metafunc
+        def __is__(m_self, m_other):
+            def impl(self: cls, other: cls) -> bool:
+                return self.__ll__ == other.__ll__
+
+            return OpSpec(impl, [m_self, m_other])
+
+        # user code
+        def norm2(self) -> i32:
+            return self.x * self.x + self.y * self.y
+
+    # The data, defined after the wrapper.
+    @struct
+    class Data:
+        x: i32
+        y: i32
+
+    return cls
 
 
-@struct
-class Point:
-    __ll__: gc_ptr[Point_data]
-
-    @blue.metafunc
-    def __getattribute__(m_self, m_name):
-        name = m_name.blueval
-        if name == "x":
-            def get_x(self: Point, attr: str) -> i32:
-                return self.__ll__.x
-            return OpSpec(get_x)
-        if name == "y":
-            def get_y(self: Point, attr: str) -> i32:
-                return self.__ll__.y
-            return OpSpec(get_y)
-        return OpSpec.NULL
-
-    @blue.metafunc
-    def __setattr__(m_self, m_name, m_v):
-        name = m_name.blueval
-        if name == "x":
-            def set_x(self: Point, attr: str, v: i32) -> None:
-                self.__ll__.x = v
-            return OpSpec(set_x)
-        if name == "y":
-            def set_y(self: Point, attr: str, v: i32) -> None:
-                self.__ll__.y = v
-            return OpSpec(set_y)
-        return OpSpec.NULL
-
-    def __new__(x: i32, y: i32) -> Point:
-        self = Point.__make__(gc_alloc[Point_data](1))
-        self.__init__(x, y)
-        return self
-
-    # user code
-    def __init__(self, x: i32, y: i32) -> None:
-        self.x = x
-        self.y = y
-
-    def norm2(self) -> i32:
-        return self.x * self.x + self.y * self.y
-
-
-def main() -> None:
-    p = Point(3, 4)
-    print(p.norm2())
-    p.x = 10
-    print(p.x)
-
-    # reference semantics: q and p are the same object
-    q = p
-    q.y = 99
-    print(p.y)
-    print(p.__ll__ == q.__ll__)
-    print(p.__ll__ == Point(10, 99).__ll__)
+Point = make_Point()
