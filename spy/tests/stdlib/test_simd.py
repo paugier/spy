@@ -9,149 +9,82 @@ class TestAlignOffset(CompilerTest):
     def memkind(self, request):
         return request.param
 
-    def test_already_aligned_returns_zero(self, memkind):
-        """alloc[i32, 16] is guaranteed 16-aligned -> offset to 16 is 0."""
+    def test_already_aligned(self, memkind):
         k = memkind
         mod = self.compile(f"""
             from simd import align_offset
-            from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
-                p: {k}_ptr[i32, 16] = {k}_alloc[i32, 16](10)
-                return align_offset(p, 16, 10)
-            """)
-        assert mod.test() == 0
+            from unsafe import {k}_alloc, {k}_ptr, align, align_cast
 
-    def test_weaker_declared_alignment_still_actually_aligned(self, memkind):
-        """
-        Declared alignment is only 1 (pessimistic), but the real address
-        (allocated with alignment 16) really is 16-aligned, so
-        align_offset should still find offset 0 -- it looks at the actual
-        runtime address, not the static alignment tag.
-        """
-        k = memkind
-        mod = self.compile(f"""
-            from simd import align_offset
-            from unsafe import {k}_alloc, {k}_ptr, align_cast
-            def test() -> i32:
-                strong: {k}_ptr[i32, 16] = {k}_alloc[i32, 16](10)
-                weak: {k}_ptr[i32, 1] = align_cast[1](strong)
+            def aligned() -> i32:
+                p: {k}_ptr[i32, align(16)] = {k}_alloc[i32, align(16)](10)
+                return align_offset(p, 16, 10)
+
+            def weak_tag() -> i32:
+                # The declared alignment is only 1, but the real address is
+                # 16-aligned: align_offset looks at the runtime address, not
+                # at the static alignment.
+                strong: {k}_ptr[i32, align(16)] = {k}_alloc[i32, align(16)](10)
+                weak: {k}_ptr[i32, align(1)] = align_cast[1](strong)
                 return align_offset(weak, 16, 10)
             """)
-        assert mod.test() == 0
+        assert mod.aligned() == 0
+        assert mod.weak_tag() == 0
 
     def test_computes_correct_offset(self, memkind):
-        """
-        Force a *known* misalignment relative to N by allocating one i8
-        "spacer" byte pointer first, then ask for offset to reach a
-        64-byte boundary with item size 4. We don't know the base address,
-        so we can't hardcode the expected offset -- instead we check the
-        *property* that defines correctness.
-        """
         k = memkind
         mod = self.compile(f"""
             from simd import align_offset
             from unsafe import {k}_alloc, {k}_ptr, ptr_to_addr
-            def test() -> i32:
-                spacer: {k}_ptr[i8] = {k}_alloc[i8](1)
-                p: {k}_ptr[i32] = {k}_alloc[i32](20)
-                n: i32 = 20
-                offset: i32 = align_offset(p, 64, n)
-                addr: i32 = ptr_to_addr(p)
-                assert offset >= 0
-                assert offset <= n
-                assert (addr + offset * 4) % 64 == 0
-                return 1
-            """)
-        assert mod.test() == 1
 
-    def test_clamped_to_n(self, memkind):
-        """
-        A huge N (e.g. 1<<20) is essentially never going to be reached
-        within a tiny buffer -- offset must be clamped to n, never exceed
-        it, and the caller can safely loop `for i in range(offset)`
-        without ever touching out-of-bounds memory.
-        """
+            def foo(N: i32) -> tuple[i32, i32]:
+                p: {k}_ptr[i32] = {k}_alloc[i32](20)
+                return align_offset(p, N, 20), ptr_to_addr(p)
+            """)
+        for N in [4, 16, 64]:
+            offset, addr = mod.foo(N)
+            assert 0 <= offset < N // 4
+            assert (addr + 4 * offset) % N == 0
+
+    def test_trivial_cases(self, memkind):
         k = memkind
         mod = self.compile(f"""
             from simd import align_offset
             from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
+
+            def clamped_to_n() -> i32:
+                # A buffer of 3 items can't reach a 1 MiB boundary: the result
+                # is clamped to n, so a `for i in range(offset)` peeling loop
+                # never goes out of bounds.
                 p: {k}_ptr[i32] = {k}_alloc[i32](3)
                 return align_offset(p, 1048576, 3)
-            """)
-        assert mod.test() == 3
 
-    def test_zero_n_is_always_zero(self, memkind):
-        k = memkind
-        mod = self.compile(f"""
-            from simd import align_offset
-            from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
+            def zero_n() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](0)
                 return align_offset(p, 4096, 0)
-            """)
-        assert mod.test() == 0
 
-    def test_N_equal_1_is_always_zero(self, memkind):
-        k = memkind
-        mod = self.compile(f"""
-            from simd import align_offset
-            from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
+            def N_is_1() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](10)
                 return align_offset(p, 1, 10)
-            """)
-        assert mod.test() == 0
 
-    def test_null_pointer_is_always_zero(self, memkind):
-        k = memkind
-        mod = self.compile(f"""
-            from simd import align_offset
-            from unsafe import {k}_ptr
-            def test() -> i32:
+            def null_pointer() -> i32:
+                # NULL (addr 0) is aligned to anything
                 p: {k}_ptr[i32] = {k}_ptr[i32].NULL
-                return align_offset(p, 4096, 0)
+                return align_offset(p, 4096, 10)
             """)
-        assert mod.test() == 0
-
-    def test_peeling_loop_then_aligned_fast_path(self, memkind):
-        """
-        The actual intended usage: peel `offset` elements in a scalar
-        loop, then process the rest -- every element gets touched exactly
-        once, regardless of where the buffer actually landed in memory.
-        """
-        k = memkind
-        mod = self.compile(f"""
-            from simd import align_offset
-            from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
-                spacer: {k}_ptr[i8] = {k}_alloc[i8](1)
-                n: i32 = 37
-                p: {k}_ptr[i32] = {k}_alloc[i32](n)
-                offset: i32 = align_offset(p, 32, n)
-
-                i: i32 = 0
-                while i < n:
-                    p[i] = i + 1
-                    i = i + 1
-
-                total: i32 = 0
-                i = 0
-                while i < n:
-                    total = total + p[i]
-                    i = i + 1
-                return total
-            """)
-        assert mod.test() == sum(range(1, 38))
+        assert mod.clamped_to_n() == 3
+        assert mod.zero_n() == 0
+        assert mod.N_is_1() == 0
+        assert mod.null_pointer() == 0
 
     def test_non_power_of_two_N_panics(self, memkind):
         k = memkind
         mod = self.compile(f"""
             from simd import align_offset
             from unsafe import {k}_alloc, {k}_ptr
-            def test() -> i32:
+
+            def foo() -> i32:
                 p: {k}_ptr[i32] = {k}_alloc[i32](50)
                 return align_offset(p, 24, 50)
             """)
         with pytest.raises(SPyError):
-            mod.test()
+            mod.foo()
