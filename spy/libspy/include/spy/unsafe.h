@@ -45,23 +45,20 @@ void *WASM_EXPORT(spy_nogc_alloc_aligned)(size_t size, size_t alignment);
     ((void *)(((uintptr_t)(p) + (uintptr_t)(alignment) - 1) &                          \
               ~((uintptr_t)(alignment) - 1)))
 
-// Check that `p` is aligned to `alignment` bytes, and return `p` unchanged.
-// Used by align_cast[N](ptr) when N strengthens the ptr's alignment claim
-// (N > the ptr's current alignment): in SPY_DEBUG builds this panics if
-// the check fails, catching a false claim before it can cause misaligned
-// accesses further down the line; in RELEASE builds it's a no-op and the
-// caller's claim is trusted, so the compiler is free to optimize the call
-// away entirely (e.g. when `alignment` is a compile-time constant already
-// known to hold).
-static inline void *
-spy_check_align(void *p, size_t alignment) {
 #ifdef SPY_DEBUG
+static inline void *
+spy_check_align_impl(void *p, size_t alignment, const char *fname, int32_t lineno) {
     if ((uintptr_t)p % alignment != 0) {
-        spy_panic("PanicError", "align_cast: address not aligned", __FILE__, __LINE__);
+        spy_panic("PanicError", "align_cast: address not aligned", fname, lineno);
     }
-#endif
     return p;
 }
+
+#define spy_check_align(p, alignment)                                                \
+    spy_check_align_impl((p), (alignment), __FILE__, __LINE__)
+#else
+#  define spy_check_align(p, alignment) ((void *)(p))
+#endif
 
 #ifdef SPY_GC_NONE
 #  define spy_gc_alloc(size) spy_nogc_alloc(size)
