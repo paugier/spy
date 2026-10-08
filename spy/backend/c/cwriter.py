@@ -702,16 +702,7 @@ class CFuncWriter:
 
     def fmt_align_cast(self, fqn: FQN, call: ast.Call, irtag: IRTag) -> C.Expr:
         """
-        align_cast[N](ptr) -> ptr with a new alignment, same address and
-        item type. N is baked into `fqn` (see fmt_cast above for why
-        `call.args` has just the ptr).
-
-        Weakening (N <= old_alignment) is just a relabeling, same as
-        ptr.weaken_align. Strengthening additionally needs a DEBUG-mode
-        runtime check; we emit it via a small static-inline helper
-        (spy_check_align, declared in unsafe.h) rather than an inline GCC
-        statement expression, so it composes normally with the rest of the
-        C AST and doesn't rely on a non-standard extension.
+        align_cast[N](ptr) -> ptr with a new alignment, same address and item type.
         """
         assert len(call.args) == 1
         w_srcT = call.args[0].w_T
@@ -720,18 +711,14 @@ class CFuncWriter:
         c_srctype = self.ctx.w2c(w_srcT)
         c_targettype = self.ctx.c_restype_by_fqn(fqn)
 
-        new_alignment = irtag.data["new_alignment"]
-        old_alignment = irtag.data["old_alignment"]
+        dst_align = irtag.data["dst_align"]
+        src_align = irtag.data["src_align"]
 
         c_p = C.Literal(f"({c_src}).p")
         c_length = C.Call(f"{c_srctype}_get_length", [c_src])
 
-        if new_alignment > old_alignment:
-            # spy_check_align(p, N) panics (in DEBUG builds) if `p` is not
-            # aligned to N; it's a no-op in RELEASE builds.
-            c_checked_p = C.Call(
-                "spy_check_align", [c_p, C.Literal(str(new_alignment))]
-            )
+        if dst_align > src_align:
+            c_checked_p = C.Call("spy_check_align", [c_p, C.Literal(str(dst_align))])
             return C.Call(f"{c_targettype}_from_raw", [c_checked_p, c_length])
         else:
             return C.Call(f"{c_targettype}_from_raw", [c_p, c_length])

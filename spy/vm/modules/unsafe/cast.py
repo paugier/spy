@@ -91,10 +91,10 @@ def w_align_cast(vm: "SPyVM", w_N: W_I32) -> W_Dynamic:
     It produces raw_ptr[T, align(N)]/gc_ptr[T, align(N)]
     (same memkind and item type as the source, new alignment N):
 
-    - Weakening (N <= old_alignment): free conversion, always safe. Note
+    - Weakening (N <= src_align): free conversion, always safe. Note
       this is also handled implicitly by W_CONVERT_TO for plain assignment;
-    - Strengthening (N > old_alignment): asserts addr % N == 0 in DEBUG
-      mode; trusts the claim in RELEASE mode.
+    - Strengthening (N > src_align): asserts addr % N == 0 in DEBUG mode;
+      trusts the claim in RELEASE mode.
     """
     N = vm.unwrap_i32(w_N)
     ns = UNSAFE.w_align_cast.fqn.with_qualifiers([str(N)])
@@ -102,16 +102,16 @@ def w_align_cast(vm: "SPyVM", w_N: W_I32) -> W_Dynamic:
     @vm.register_builtin_func(ns, "impl", color="blue", kind="metafunc")
     def w_align_cast_dispatch(vm: "SPyVM", wam_ptr: W_MetaArg) -> W_OpSpec:
         w_srcT = _check_ptr_static(vm, wam_ptr, "align_cast")
-        old_alignment = w_srcT.resolved_alignment()
+        src_align = w_srcT.resolved_alignment()
         w_dstT = _ptrtype_like(vm, w_srcT, w_srcT.w_itemT, N)
 
         SRC = Annotated[W_Ptr, w_srcT]
         DST = Annotated[W_Ptr, w_dstT]
-        irtag = IRTag("unsafe.align_cast", new_alignment=N, old_alignment=old_alignment)
+        irtag = IRTag("unsafe.align_cast", dst_align=N, src_align=src_align)
 
         @vm.register_builtin_func(w_srcT.fqn, "align_cast", [str(N)], irtag=irtag)
         def w_align_cast_impl(vm: "SPyVM", w_ptr: SRC) -> DST:
-            if N > old_alignment and w_ptr.addr % N != 0:
+            if N > src_align and w_ptr.addr % N != 0:
                 raise SPyError(
                     "W_PanicError",
                     f"align_cast: address 0x{w_ptr.addr:x} not aligned to {N}",
