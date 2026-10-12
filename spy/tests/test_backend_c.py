@@ -10,9 +10,9 @@ import textwrap
 import py.path
 import pytest
 
-from spy.backend.c.c_ast import BinOp, Expr, Literal, UnaryOp, make_table
+from spy.backend.c.c_ast import BinOp, Cast, Expr, Literal, UnaryOp, make_table
 from spy.backend.c.cbackend import CBackend
-from spy.backend.c.context import C_Ident
+from spy.backend.c.context import C_Ident, C_Type
 from spy.build.config import BuildConfig
 from spy.fqn import FQN
 from spy.vm.vm import SPyVM
@@ -116,6 +116,14 @@ class TestCBackend:
         assert str(BinOp("+", a, BinOp("*", b, c))) == "a + b * c"
         assert str(BinOp("<", BinOp("+", a, b), c)) == "a + b < c"
         assert str(BinOp("&&", BinOp("==", a, b), c)) == "a == b && c"
+
+    def test_Cast_operand(self):
+        a, b = Literal("a"), Literal("b")
+        t = C_Type("T")
+        assert str(Cast(t, a)) == "(T)a"
+        # a cast binds tighter than any binary operator
+        assert str(Cast(t, BinOp("|", a, b))) == "(T)(a | b)"
+        assert str(Cast(t, UnaryOp("~", a))) == "(T)~a"
 
     def test_UnaryOp(self):
         # fmt: off

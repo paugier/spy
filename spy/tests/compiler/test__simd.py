@@ -340,3 +340,218 @@ class TestSIMD(CompilerTest):
         """
         mod = self.compile(src)
         assert mod.entry() == (1.0, 2.0, 3.0, 4.0)
+
+    def test_arithmetic_all_dtypes(self):
+        src = """
+        from _simd import SIMD
+
+        def func[T](x: T, y: T) -> tuple[T, T, T]:
+            a = SIMD[T, 2](x, y)
+            b = SIMD[T, 2](y, x)
+            s = a + b
+            d = a - b
+            m = a * b
+            return s[1], d[0], m[0]
+
+        f_i8 = func[i8]
+        f_u8 = func[u8]
+        f_i32 = func[i32]
+        f_u32 = func[u32]
+        f_i64 = func[i64]
+        f_u64 = func[u64]
+        f_f32 = func[f32]
+        f_f64 = func[f64]
+        """
+        mod = self.compile(src)
+        assert mod.f_i8(7, 3) == (10, 4, 21)
+        assert mod.f_u8(7, 3) == (10, 4, 21)
+        assert mod.f_i32(7, 3) == (10, 4, 21)
+        assert mod.f_u32(7, 3) == (10, 4, 21)
+        assert mod.f_i64(7, 3) == (10, 4, 21)
+        assert mod.f_u64(7, 3) == (10, 4, 21)
+        assert mod.f_f32(1.5, 0.5) == (2.0, 1.0, 0.75)
+        assert mod.f_f64(1.5, 0.5) == (2.0, 1.0, 0.75)
+
+    def test_integer_wraparound(self):
+        src = """
+        from _simd import SIMD
+
+        def func[T](x: T, y: T) -> tuple[T, T, T]:
+            a = SIMD[T, 2].splat(x)
+            b = SIMD[T, 2].splat(y)
+            return (a + b)[0], (a - b)[0], (a * b)[0]
+
+        f_i8 = func[i8]
+        f_u8 = func[u8]
+        f_i32 = func[i32]
+        f_u32 = func[u32]
+        """
+        mod = self.compile(src)
+        assert mod.f_i8(100, 100) == (-56, 0, 16)
+        assert mod.f_u8(100, 200) == (44, 156, 32)
+        assert mod.f_i32(2147483647, 2) == (-2147483647, 2147483645, -2)
+        assert mod.f_u32(0, 1) == (1, 4294967295, 0)
+
+    def test_float_division(self):
+        src = """
+        from _simd import SIMD
+
+        def func[T](x: T, y: T) -> tuple[T, T]:
+            q = SIMD[T, 2](x, y) / SIMD[T, 2](y, x)
+            return q[0], q[1]
+
+        f_f32 = func[f32]
+        f_f64 = func[f64]
+        """
+        mod = self.compile(src)
+        assert mod.f_f32(6.0, 3.0) == (2.0, 0.5)
+        assert mod.f_f64(6.0, 3.0) == (2.0, 0.5)
+
+    def test_integer_division_rejected(self):
+        src = """
+        from _simd import SIMD
+
+        def bad() -> None:
+            v = SIMD[i32, 4].splat(1)
+            w = v / v
+        """
+        errors = expect_errors("cannot do `SIMD[i32, 4]` / `SIMD[i32, 4]`")
+        self.compile_raises(src, "bad", errors)
+
+    def test_comparison(self):
+        src = """
+        from _simd import SIMD
+
+        def lt[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a < b
+            return m[0], m[1], m[2], m[3]
+
+        def le[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a <= b
+            return m[0], m[1], m[2], m[3]
+
+        def gt[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a > b
+            return m[0], m[1], m[2], m[3]
+
+        def ge[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a >= b
+            return m[0], m[1], m[2], m[3]
+
+        def eq[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a == b
+            return m[0], m[1], m[2], m[3]
+
+        def ne[T, M](x: T, y: T) -> tuple[M, M, M, M]:
+            a = SIMD[T, 4](x, y, y, x)
+            b = SIMD[T, 4](y, y, x, x)
+            m = a != b
+            return m[0], m[1], m[2], m[3]
+
+        lt_i32 = lt[i32, i32]
+        le_i32 = le[i32, i32]
+        gt_i32 = gt[i32, i32]
+        ge_i32 = ge[i32, i32]
+        eq_i32 = eq[i32, i32]
+        ne_i32 = ne[i32, i32]
+
+        lt_i8 = lt[i8, i8]
+        lt_u8 = lt[u8, i8]
+        lt_u32 = lt[u32, i32]
+        lt_f32 = lt[f32, i32]
+        lt_i64 = lt[i64, i64]
+        lt_u64 = lt[u64, i64]
+        lt_f64 = lt[f64, i64]
+        """
+        mod = self.compile(src)
+        assert mod.lt_i32(1, 2) == (-1, 0, 0, 0)
+        assert mod.le_i32(1, 2) == (-1, -1, 0, -1)
+        assert mod.gt_i32(1, 2) == (0, 0, -1, 0)
+        assert mod.ge_i32(1, 2) == (0, -1, -1, -1)
+        assert mod.eq_i32(1, 2) == (0, -1, 0, -1)
+        assert mod.ne_i32(1, 2) == (-1, 0, -1, 0)
+
+        assert mod.lt_i8(-1, 2) == (-1, 0, 0, 0)
+        assert mod.lt_u8(200, 250) == (-1, 0, 0, 0)  # unsigned comparison
+        assert mod.lt_u32(1, 4000000000) == (-1, 0, 0, 0)
+        assert mod.lt_f32(1.5, 2.5) == (-1, 0, 0, 0)
+        assert mod.lt_i64(1, 2) == (-1, 0, 0, 0)
+        assert mod.lt_u64(1, 2) == (-1, 0, 0, 0)
+        assert mod.lt_f64(1.5, 2.5) == (-1, 0, 0, 0)
+
+    def test_select(self):
+        src = """
+        from _simd import SIMD
+
+        def func[T](x: T, y: T) -> tuple[T, T, T, T]:
+            a = SIMD[T, 4].splat(x)
+            b = SIMD[T, 4].splat(y)
+            m = SIMD[T, 4](x, y, y, x) < SIMD[T, 4](y, y, x, x)
+            r = m.select(a, b)
+            return r[0], r[1], r[2], r[3]
+
+        # any integer vector of the same lane width can be a mask
+        def handmade_mask() -> tuple[f32, f32, f32, f32]:
+            m = SIMD[i32, 4](-1, 0, -1, 0)
+            r = m.select(SIMD[f32, 4].splat(1.0), SIMD[f32, 4].splat(2.0))
+            return r[0], r[1], r[2], r[3]
+
+        f_i8 = func[i8]
+        f_u8 = func[u8]
+        f_i32 = func[i32]
+        f_u32 = func[u32]
+        f_i64 = func[i64]
+        f_u64 = func[u64]
+        f_f32 = func[f32]
+        f_f64 = func[f64]
+        """
+        mod = self.compile(src)
+        assert mod.f_i8(1, 2) == (1, 2, 2, 2)
+        assert mod.f_u8(1, 2) == (1, 2, 2, 2)
+        assert mod.f_i32(1, 2) == (1, 2, 2, 2)
+        assert mod.f_u32(1, 2) == (1, 2, 2, 2)
+        assert mod.f_i64(1, 2) == (1, 2, 2, 2)
+        assert mod.f_u64(1, 2) == (1, 2, 2, 2)
+        assert mod.f_f32(1.5, 2.5) == (1.5, 2.5, 2.5, 2.5)
+        assert mod.f_f64(1.5, 2.5) == (1.5, 2.5, 2.5, 2.5)
+        assert mod.handmade_mask() == (1.0, 2.0, 1.0, 2.0)
+
+    @only_interp
+    def test_select_invalid_mask(self):
+        src = """
+        from _simd import SIMD
+
+        def bad_size() -> None:
+            m = SIMD[i32, 2].zeros()
+            m.select(SIMD[f32, 4].zeros(), SIMD[f32, 4].zeros())
+
+        def bad_width() -> None:
+            m = SIMD[i8, 4].zeros()
+            m.select(SIMD[f32, 4].zeros(), SIMD[f32, 4].zeros())
+
+        def bad_float() -> None:
+            m = SIMD[f32, 4].zeros()
+            m.select(SIMD[f32, 4].zeros(), SIMD[f32, 4].zeros())
+        """
+
+        def check_error(funcname: str, mask_t: str) -> None:
+            msg = (
+                "expected an integer SIMD with size 4 and 4-byte lanes "
+                f"(e.g. `SIMD[i32, 4]`), got `{mask_t}`"
+            )
+            errors = expect_errors("invalid mask for `select`", (msg, "m"))
+            self.compile_raises(src, funcname, errors)
+
+        check_error("bad_size", "SIMD[i32, 2]")
+        check_error("bad_width", "SIMD[i8, 4]")
+        check_error("bad_float", "SIMD[f32, 4]")
