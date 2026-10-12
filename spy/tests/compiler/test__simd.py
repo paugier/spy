@@ -546,7 +546,7 @@ class TestSIMD(CompilerTest):
 
         def check_error(funcname: str, mask_t: str) -> None:
             msg = (
-                "expected an integer SIMD with size 4 and 4-byte lanes "
+                "expected an integer SIMD with length 4 and 4-byte lanes "
                 f"(e.g. `SIMD[i32, 4]`), got `{mask_t}`"
             )
             errors = expect_errors("invalid mask for `select`", (msg, "m"))

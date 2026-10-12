@@ -606,6 +606,12 @@ class CFuncWriter:
         elif irtag.tag == "simd.getitem":
             return self.fmt_simd_getitem(fqn, call)
 
+        elif irtag.tag in ("simd.binop", "simd.cmp"):
+            return self.fmt_simd_binop(fqn, call, irtag)
+
+        elif irtag.tag == "simd.select":
+            return self.fmt_simd_select(fqn, call)
+
         elif irtag.tag == "ptr.getfield":
             return self.fmt_ptr_getfield(fqn, call, irtag)
 
@@ -775,6 +781,37 @@ class CFuncWriter:
         c_v = self.fmt_expr(call.args[0])
         c_i = self.fmt_expr(call.args[1])
         return C.Index(c_v, c_i)
+
+    def fmt_simd_binop(self, fqn: FQN, call: ast.Call, irtag: IRTag) -> C.Expr:
+        # also used for comparisons: the result is the mask vector of gcc/clang
+        assert len(call.args) == 2
+        c_l = self.fmt_expr(call.args[0])
+        c_r = self.fmt_expr(call.args[1])
+        return C.BinOp(irtag.data["op"], c_l, c_r)
+
+    def fmt_simd_select(self, fqn: FQN, call: ast.Call) -> C.Expr:
+        # call.args = [mask, "select" (ignored), a, b]
+        from spy.vm.modules._simd import W_SimdType
+
+        assert len(call.args) == 4
+        w_func = self.ctx.vm.lookup_global(fqn)
+        assert isinstance(w_func, W_Func)
+        w_mask_t = w_func.w_functype.params[0].w_T
+        w_op_t = w_func.w_functype.w_restype
+        assert isinstance(w_mask_t, W_SimdType)
+        assert isinstance(w_op_t, W_SimdType)
+        c_mask_t = self.ctx.w2c(w_mask_t)
+        c_op_t = self.ctx.w2c(w_op_t)
+        c_m = self.fmt_expr(call.args[0])
+        c_a = self.fmt_expr(call.args[2])
+        c_b = self.fmt_expr(call.args[3])
+        # (T)((m & (M)a) | (~m & (M)b))
+        blend = C.BinOp(
+            "|",
+            C.BinOp("&", c_m, C.Cast(c_mask_t, c_a)),
+            C.BinOp("&", C.UnaryOp("~", c_m), C.Cast(c_mask_t, c_b)),
+        )
+        return C.Cast(c_op_t, blend)
 
     def fmt_ptr_getfield(self, fqn: FQN, call: ast.Call, irtag: IRTag) -> C.Expr:
         assert isinstance(call.args[1], ast.StrLiteral)

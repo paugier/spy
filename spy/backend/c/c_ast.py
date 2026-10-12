@@ -386,7 +386,10 @@ class Cast(Expr):
         return 13
 
     def __str__(self) -> str:
-        return f"({self.type}){self.expr}"
+        e = str(self.expr)
+        if self.expr.precedence() < self.precedence():
+            e = f"({e})"
+        return f"({self.type}){e}"
 
 
 @dataclass
