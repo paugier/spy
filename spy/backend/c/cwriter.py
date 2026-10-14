@@ -790,10 +790,10 @@ class CFuncWriter:
         return C.BinOp(irtag.data["op"], c_l, c_r)
 
     def fmt_simd_select(self, fqn: FQN, call: ast.Call) -> C.Expr:
-        # call.args = [mask, "select" (ignored), a, b]
+        # call.args = [mask, a, b]
         from spy.vm.modules._simd import W_SimdType
 
-        assert len(call.args) == 4
+        assert len(call.args) == 3
         w_func = self.ctx.vm.lookup_global(fqn)
         assert isinstance(w_func, W_Func)
         w_mask_t = w_func.w_functype.params[0].w_T
@@ -803,8 +803,8 @@ class CFuncWriter:
         c_mask_t = self.ctx.w2c(w_mask_t)
         c_op_t = self.ctx.w2c(w_op_t)
         c_m = self.fmt_expr(call.args[0])
-        c_a = self.fmt_expr(call.args[2])
-        c_b = self.fmt_expr(call.args[3])
+        c_a = self.fmt_expr(call.args[1])
+        c_b = self.fmt_expr(call.args[2])
         # (T)((m & (M)a) | (~m & (M)b))
         blend = C.BinOp(
             "|",
