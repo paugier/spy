@@ -1,5 +1,6 @@
 import importlib.util
 import itertools
+import os
 import sys
 import typing
 from ctypes import c_float as float32
@@ -24,6 +25,7 @@ from spy.vm.b import OP, B
 from spy.vm.bluecache import BlueCache
 from spy.vm.builtin import make_builtin_func
 from spy.vm.bytes import W_Bytes
+from spy.vm.cell import W_Cell
 from spy.vm.debugger import spdb
 from spy.vm.exc import W_TypeError
 from spy.vm.function import (
@@ -106,6 +108,10 @@ w_DynamicType.define(W_Object)
 STDLIB = ROOT.join("..", "stdlib")
 
 
+if typing.TYPE_CHECKING:
+    from spy.vm.native import NativeRegistry
+
+
 class SPyVM:
     """
     A Virtual Machine to execute SPy code.
@@ -141,8 +147,13 @@ class SPyVM:
         ll: Optional[LLSPyInstance] = None,
         *,
         extra_vm_modules: list[str] = [],
+        native_stdlib: Optional[bool] = None,
     ) -> None:
         self.build_info_funcs = {}
+        self.native: Optional["NativeRegistry"] = None
+        if native_stdlib is None:
+            # opt-in while this is a prototype
+            native_stdlib = os.environ.get("SPY_NATIVE_STDLIB") == "1"
         if ll is None:
             # Import extra module packages first so we can collect their
             # wasm_archive paths before constructing ll.
@@ -153,6 +164,12 @@ class SPyVM:
             for build_info_fn in self.build_info_funcs.values():
                 for archive in build_info_fn("wasi", "debug").archives:
                     extra_archives.append(py.path.local(archive))
+            if native_stdlib:
+                from spy.build.native_stdlib import get_archive
+                from spy.vm.native import NativeRegistry
+
+                extra_archives.append(get_archive())
+                self.native = NativeRegistry()
             llmod = libspy.get_LLMOD(extra_archives)
             self.ll = LLSPyInstance(llmod)
         else:
@@ -216,6 +233,24 @@ class SPyVM:
         """
         self._globals_w[fqn] = w_value
         self._reverse_globals.setdefault(w_value, fqn)
+
+    def maybe_native_func(self, fqn: FQN, w_func: W_Object) -> W_Object:
+        """
+        If a prebuilt compiled version of `fqn` exists, return it in place of
+        the interpreted w_func. Must be applied BEFORE the function is stored
+        anywhere (globals, module namespace, closures), so that everybody sees
+        the replacement.
+        """
+        if self.native is None:
+            return w_func
+        return self.native.maybe_replace_func(fqn, w_func)
+
+    def make_cell(self, fqn: FQN, w_val: W_Object) -> W_Cell:
+        if self.native is not None:
+            w_cell = self.native.maybe_make_cell(self, fqn, w_val)
+            if w_cell is not None:
+                return w_cell
+        return W_Cell(fqn, w_val)
 
     def globals_get(self, fqn: FQN) -> W_Object:
         return self._globals_w[fqn]
