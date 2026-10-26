@@ -1,7 +1,9 @@
 """
 PROTOTYPE: call prebuilt (compiled) stdlib functions from the interpreter.
 
-See spy.build.native_stdlib for the build side.
+See spy.build.native_stdlib for the build side, which also produces the
+manifest: the list of functions and module-level variables which are
+implemented by the compiled code.
 
 The compiled code lives in the same WASM instance as the interpreter's heap
 (vm.ll), so pointers can be passed around as plain addresses and module-level
@@ -12,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from spy.build import native_stdlib as ns
 from spy.fqn import FQN
-from spy.location import Loc
 from spy.vm.b import TYPES, B
 from spy.vm.cell import W_Cell
 from spy.vm.function import W_ASTFunc, W_Func
@@ -31,6 +32,8 @@ def _to_wasm(w_arg: W_Object, vm: "SPyVM") -> Any:
     v = vm.unwrap(w_arg)
     if isinstance(w_arg, W_U32) and v >= 2**31:
         v -= 2**32
+    elif isinstance(w_arg, W_Bool):
+        v = int(v)
     return v
 
 
@@ -44,7 +47,7 @@ def _from_wasm(vm: "SPyVM", w_T: Any, v: Any) -> W_Object:
     elif w_T is B.w_f32:
         return W_F32(v)
     elif w_T is B.w_bool:
-        return W_Bool(bool(v))  # type: ignore
+        return vm.wrap(bool(v))
     raise NotImplementedError(f"cannot marshal result of type {w_T}")
 
 
@@ -80,17 +83,27 @@ class W_NativeCell(W_Cell):
     """
     A module-level variable whose storage is a C global in linear memory.
 
-    Only ptr-typed variables are supported for now: the layout is
-    {addr: i32, length: i32}, which matches the C struct in SPY_DEBUG builds.
+    Two kinds are supported, the same as the ones supported by the C backend:
+
+      - "i32": a 32-bit integer;
+      - "ptr": {addr: i32, length: i32}, which matches the C struct in
+        SPY_DEBUG builds.
     """
 
-    def __init__(self, vm: "SPyVM", fqn: FQN, w_initial: W_Object, export: str) -> None:
-        w_T = vm.dynamic_type(w_initial)
-        assert isinstance(w_T, W_PtrType), "only ptr cells are supported"
+    def __init__(
+        self, vm: "SPyVM", fqn: FQN, w_initial: W_Object, nc: ns.NativeCell
+    ) -> None:
         self.fqn = fqn
-        self._w_T = w_T
         self._vm = vm
-        self._addr = vm.ll.call(export)
+        self._kind = nc.kind
+        self._w_T = vm.dynamic_type(w_initial)
+        if nc.kind == "ptr":
+            assert isinstance(self._w_T, W_PtrType)
+        elif nc.kind == "i32":
+            assert self._w_T is B.w_i32
+        else:
+            raise NotImplementedError(f"unsupported kind of native cell: {nc.kind}")
+        self._addr = vm.ll.call(nc.export)
         # NOTE: the initial value is deliberately ignored: the C global is
         # statically initialized by the compiled module.
 
@@ -98,32 +111,56 @@ class W_NativeCell(W_Cell):
         return f"<spy native cell {self.fqn} @0x{self._addr:x}>"
 
     def get(self) -> W_Object:
-        addr, length = self._vm.ll.mem.read_ptr(self._addr)
+        mem = self._vm.ll.mem
+        if self._kind == "i32":
+            return W_I32(mem.read_i32(self._addr))
+        addr, length = mem.read_ptr(self._addr)
         return W_Ptr(self._w_T, addr, length)  # type: ignore
 
     def set(self, w_val: W_Object) -> None:
-        assert isinstance(w_val, W_Ptr)
         mem = self._vm.ll.mem
-        mem.write_i32(self._addr, int(w_val.addr))
-        mem.write_i32(self._addr + 4, int(w_val.length))
+        if self._kind == "i32":
+            assert isinstance(w_val, W_I32)
+            mem.write_i32(self._addr, int(w_val.value))
+        else:
+            assert isinstance(w_val, W_Ptr)
+            mem.write_i32(self._addr, int(w_val.addr))
+            mem.write_i32(self._addr + 4, int(w_val.length))
 
 
 class NativeRegistry:
+    """
+    Which functions and variables are implemented by the compiled code, as
+    described by the manifest.
+    """
+
     funcs: dict[str, ns.NativeFunc]
     cells: dict[str, ns.NativeCell]
 
-    def __init__(self) -> None:
-        self.funcs = {f.fqn: f for f in ns.FUNCS}
-        self.cells = {c.fqn: c for c in ns.CELLS}
+    def __init__(self, manifest: ns.Manifest) -> None:
+        self.funcs = {f.fqn: f for f in manifest.funcs}
+        self.cells = {c.fqn: c for c in manifest.cells}
 
     def maybe_replace_func(self, fqn: FQN, w_func: W_Object) -> W_Object:
         nf = self.funcs.get(str(fqn))
         if nf is None or not isinstance(w_func, W_ASTFunc):
             return w_func
-        return W_NativeFunc(w_func, nf.export_name)
+        # the manifest is generated from the same sources, so the signature
+        # must be the same: if not, something is out of sync, and calling the
+        # compiled code would silently produce garbage
+        w_ft = w_func.w_functype
+        params = [ns.type_name(p.w_T) for p in w_ft.params]
+        restype = ns.type_name(w_ft.w_restype)
+        if (params, restype) != (nf.params, nf.restype):
+            raise RuntimeError(
+                f"native stdlib out of sync: {fqn} is ({', '.join(params)}) -> "
+                f"{restype} but the manifest says ({', '.join(nf.params)}) -> "
+                f"{nf.restype}"
+            )
+        return W_NativeFunc(w_func, nf.export)
 
     def maybe_make_cell(self, vm: "SPyVM", fqn: FQN, w_val: W_Object) -> W_Cell | None:
         nc = self.cells.get(str(fqn))
         if nc is None:
             return None
-        return W_NativeCell(vm, fqn, w_val, nc.export_name)
+        return W_NativeCell(vm, fqn, w_val, nc)

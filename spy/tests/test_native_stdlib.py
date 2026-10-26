@@ -7,7 +7,9 @@ import pytest
 
 from spy.errors import SPyError
 from spy.fqn import FQN
+from spy.vm.function import W_Func
 from spy.vm.native import W_NativeCell, W_NativeFunc
+from spy.vm.object import W_Object
 from spy.vm.primitive import W_F64, W_U32
 from spy.vm.vm import SPyVM
 
@@ -26,8 +28,9 @@ def make_vm(native: bool) -> SPyVM:
     return vm
 
 
-def call(vm: SPyVM, name: str, *args):
+def call(vm: SPyVM, name: str, *args: W_Object) -> W_Object:
     w_func = vm.lookup_global(FQN(name))
+    assert isinstance(w_func, W_Func)
     return vm.fast_call(w_func, list(args))
 
 

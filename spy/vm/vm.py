@@ -109,6 +109,7 @@ STDLIB = ROOT.join("..", "stdlib")
 
 
 if typing.TYPE_CHECKING:
+    from spy.build.native_stdlib import NativeStdlib
     from spy.vm.native import NativeRegistry
 
 
@@ -147,7 +148,7 @@ class SPyVM:
         ll: Optional[LLSPyInstance] = None,
         *,
         extra_vm_modules: list[str] = [],
-        native_stdlib: Optional[bool] = None,
+        native_stdlib: Union[bool, "NativeStdlib", None] = None,
     ) -> None:
         self.build_info_funcs = {}
         self.native: Optional["NativeRegistry"] = None
@@ -165,11 +166,15 @@ class SPyVM:
                 for archive in build_info_fn("wasi", "debug").archives:
                     extra_archives.append(py.path.local(archive))
             if native_stdlib:
-                from spy.build.native_stdlib import get_archive
+                from spy.build.native_stdlib import NativeStdlib, get_native_stdlib
                 from spy.vm.native import NativeRegistry
 
-                extra_archives.append(get_archive())
-                self.native = NativeRegistry()
+                # True means "the default set of prebuilt modules"
+                if native_stdlib is True:
+                    native_stdlib = get_native_stdlib()
+                assert isinstance(native_stdlib, NativeStdlib)
+                extra_archives.append(native_stdlib.archive)
+                self.native = NativeRegistry(native_stdlib.manifest)
             llmod = libspy.get_LLMOD(extra_archives)
             self.ll = LLSPyInstance(llmod)
         else:
