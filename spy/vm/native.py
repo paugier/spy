@@ -19,6 +19,7 @@ from spy.vm.cell import W_Cell
 from spy.vm.function import W_ASTFunc, W_Func
 from spy.vm.modules.unsafe.ptr import W_Ptr, W_PtrType
 from spy.vm.object import W_Object
+from spy.vm.str import W_Str
 from spy.vm.primitive import W_F32, W_F64, W_I32, W_U32, W_Bool
 
 if TYPE_CHECKING:
@@ -29,6 +30,8 @@ def _to_wasm(w_arg: W_Object, vm: "SPyVM") -> Any:
     """
     wasm has only signed i32: u32 values >= 2**31 must be reinterpreted.
     """
+    if isinstance(w_arg, W_Str):
+        return w_arg.ptr
     v = vm.unwrap(w_arg)
     if isinstance(w_arg, W_U32) and v >= 2**31:
         v -= 2**32
@@ -48,6 +51,8 @@ def _from_wasm(vm: "SPyVM", w_T: Any, v: Any) -> W_Object:
         return W_F32(v)
     elif w_T is B.w_bool:
         return vm.wrap(bool(v))
+    elif w_T is B.w_str:
+        return W_Str.from_ptr(vm, v)
     raise NotImplementedError(f"cannot marshal result of type {w_T}")
 
 

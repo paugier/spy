@@ -52,7 +52,7 @@ def scalar_types() -> list[W_Type]:
     """
     from spy.vm.b import B
 
-    return [B.w_i32, B.w_u32, B.w_f64, B.w_f32, B.w_bool]
+    return [B.w_i32, B.w_u32, B.w_f64, B.w_f32, B.w_bool, B.w_str]
 
 
 def result_types() -> list[W_Type]:
