@@ -62,6 +62,13 @@ def filename_callback(value: Path) -> Path:
     return value
 
 
+def filename_optional_callback(value: Optional[Path]) -> Optional[Path]:
+    # like filename_callback, but for the commands for which the filename is optional
+    if value is None:
+        return None
+    return filename_callback(value)
+
+
 @dataclass
 class Filename_Required_Args:
     filename: Annotated[

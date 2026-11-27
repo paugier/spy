@@ -125,21 +125,24 @@ def execute_spy_main(
 
 class Init_Args(Protocol):
     error_mode: ErrorMode
-    filename: Path
     extra_vm_modules: Optional[list[str]]
     no_spy_toml: bool
+
+    @property
+    def filename(self) -> Optional[Path]: ...
 
 
 async def init_vm(args: Init_Args) -> SPyVM:
     global GLOBAL_VM
 
-    if args.filename.suffix == ".py":
-        print(
-            f"Error: {args.filename} is a .py file, not a .spy file.", file=sys.stderr
-        )
+    # some commands (e.g. `ispy`) can be used without a FILENAME: in that case,
+    # the vm path and spy.toml are resolved from the current directory
+    filename = args.filename
+    if filename is not None and filename.suffix == ".py":
+        print(f"Error: {filename} is a .py file, not a .spy file.", file=sys.stderr)
         sys.exit(1)
 
-    srcdir = args.filename.parent
+    srcdir = filename.parent if filename is not None else Path.cwd()
 
     if args.no_spy_toml:
         spy_toml = SpyToml(srcdir / "spy.toml")

@@ -1,23 +1,31 @@
 """
-The SPy REPL (`spy repl FILE`, alias `ispy FILE`).
+The SPy REPL (`ispy`, alias `spy repl`).
 
 SPy has two very different kinds of scope: the module scope and the function
-scope. A REPL has to respect that, so a session is split in two steps:
+scope. A REPL has to respect that, so a session has two modes:
 
-  1. `FILE` holds the module-scope code. It is imported once, as a normal
-     module.
+  1. module scope (prompt `module>>>`): the user types module-scope code:
+     imports, `def`, `class` and global assignments. Nothing runs there: each
+     input is checked (parsed and scope-analyzed together with the prelude)
+     and appended to the *prelude*, i.e. the module-scope source code of the
+     session. `%main` freezes the prelude and switches to main scope.
 
-  2. The user then types statements at the beginning of an empty function (the
-     "repl main"), living in the same module as FILE: everything defined in
-     FILE is visible, and the variables created interactively are locals of
-     that function, which stay alive for the whole session.
+  2. main scope (prompt `>>>`): the user types statements and expressions,
+     which run in the live frame of an empty function, the "repl main", living
+     in the same module as the prelude: everything defined in the prelude is
+     visible, and the variables created interactively are locals of that
+     function, which stay alive for the whole session.
 
-How it works: one `ASTFrame` for the repl main is created at the beginning and
-lives as long as the session. We don't touch ScopeAnalyzer: for each input, we
-run the normal parse/scope-analysis/astcompile pipeline on the *whole* source
-(FILE, plus the repl main whose body is made of all the inputs accepted so far,
-plus the new input). This is simple and gives the correct scoping for free.
-Then we execute in the live frame only the statements which are new.
+Every session starts with the DEFAULT_PRELUDE, a few imports that SPy code
+commonly needs.
+
+How main scope works: one `ASTFrame` for the repl main is created when the
+session switches to main scope and lives as long as the session. We don't
+touch ScopeAnalyzer: for each input, we run the normal
+parse/scope-analysis/astcompile pipeline on the *whole* source (the prelude,
+plus the repl main whose body is made of all the inputs accepted so far, plus
+the new input). This is simple and gives the correct scoping for free. Then we
+execute in the live frame only the statements which are new.
 """
 
 import codeop
@@ -47,16 +55,34 @@ from spy.vm.vm import SPyVM
 # own `main`, which the user can then call from the REPL.
 REPL_MAIN = "__repl_main__"
 
+# Module-scope source code which every session starts with, so that the prompt is
+# usable without ceremony. Literals (list, tuple, dict, ...) do not need an import:
+# the REPL loads the corresponding module implicitly for each input, like for normal
+# modules.
+DEFAULT_PRELUDE = (
+    "from __spy__ import COLOR, as_red, interp_list, interp_dict, interp_tuple\n"
+)
+
 EXIT_COMMANDS = ("exit", "exit()", "quit", "quit()")
+
+MODULE_PROMPT = "module>>> "
+MAIN_PROMPT = ">>> "
+CONT_PROMPT = "... "
+
+
+def _ensure_nl(src: str) -> str:
+    if src and not src.endswith("\n"):
+        return src + "\n"
+    return src
 
 
 class _ReplImporter(ImportAnalyzer):
     """
-    Import FILE as a module, but with the repl main appended to it.
+    Import the prelude as a module, but with the repl main appended to it.
 
     By overriding astcompile_one we get, for free, the handling of everything which
-    FILE imports (explicit and implicit imports, import order, errors, .spyc cache of
-    the dependencies, etc.)
+    the prelude imports (explicit and implicit imports, import order, errors, .spyc
+    cache of the dependencies, etc.)
     """
 
     def __init__(self, session: "ReplSession", use_spyc: bool) -> None:
@@ -67,6 +93,15 @@ class _ReplImporter(ImportAnalyzer):
         if modname == self.session.modname:
             return self.session.compile([])
         return super().astcompile_one(modname, spyfile)
+
+    def find_file_on_path(self, modname: str) -> Optional[py.path.local]:
+        res = super().find_file_on_path(modname)
+        if res is None and modname == self.session.modname:
+            # the root module of the session might not exist as a file (e.g. `ispy`
+            # without arguments): its source is the prelude, which astcompile_one
+            # compiles directly
+            res = py.path.local(f"{modname}.spy")
+        return res
 
 
 class ReplSession:
@@ -80,55 +115,64 @@ class ReplSession:
     vm: SPyVM
     filename: str
     modname: str
-    prelude: str  # source code of FILE
+    prelude: str  # module-scope source code of the session
+    mode: str  # "module" or "main"
     use_spyc: bool
-    inputs: list[str]  # inputs accepted so far
+    inputs: list[str]  # main-scope inputs accepted so far
     n_done: int  # number of compiled stmts, in the repl main, already executed
-    frame: ASTFrame
+    frame: Optional[ASTFrame]  # the frame of the repl main, in main scope only
 
-    def __init__(self, vm: SPyVM, filename: Path, *, use_spyc: bool = True) -> None:
+    def __init__(
+        self,
+        vm: SPyVM,
+        filename: Optional[Path],
+        *,
+        module_scope: bool = False,
+        use_spyc: bool = True,
+    ) -> None:
         self.vm = vm
-        self.filename = str(filename)
-        self.modname = filename.stem
-        self.prelude = filename.read_text()
+        if filename is not None:
+            self.filename = str(filename)
+            self.modname = filename.stem
+            file_src = filename.read_text()
+        else:
+            self.filename = "<repl>"
+            self.modname = "repl"
+            file_src = ""
         self.use_spyc = use_spyc
+        self.prelude = DEFAULT_PRELUDE + _ensure_nl(file_src)
+        self.mode = "module"
         self.inputs = []
         self.n_done = 0
+        self.frame = None
 
         if self.modname in vm.modules_w:
             # e.g. a file called `math.spy`: ImportAnalyzer would consider it as
             # already imported and never compile it
             raise SPyError(
                 "W_ImportError",
-                f"cannot start the REPL on `{filename.name}`: "
+                f"cannot start the REPL on `{self.filename}`: "
                 f"a module called `{self.modname}` already exists, please rename it",
             )
-        importer = _ReplImporter(self, use_spyc)
-        importer.astcompile_all()
-        importer.import_all()
+        if not module_scope:
+            self.enter_main()
 
-        w_mod = vm.modules_w[self.modname]
-        w_main = w_mod.getattr_maybe(vm, REPL_MAIN)
-        assert isinstance(w_main, W_ASTFunc)
-        self.frame = ASTFrame(vm, w_main, [])
-        self.frame.declare_arguments()
-
-    def compile(self, inputs: list[str]) -> ast.Module:
+    def _module_src(self, extra: str = "") -> str:
         """
-        Parse, analyze and astcompile FILE + the repl main containing `inputs`.
+        The whole module-scope source: the prelude, plus `extra`.
         """
         src = self.prelude
-        if not src.endswith("\n"):
-            src += "\n"
-        src += f"\n\ndef {REPL_MAIN}() -> None:\n"
-        if inputs:
-            src += textwrap.indent("\n".join(inputs), "    ") + "\n"
-        else:
-            src += "    pass\n"
+        if extra:
+            src = _ensure_nl(src) + _ensure_nl(extra)
+        return src
 
-        # we want the source lines of both FILE and of the inputs to be shown in the
-        # error messages: they are all in `src`. An entry without mtime is never
-        # invalidated by linecache.checkcache
+    def _scope_analyze(self, src: str) -> tuple[ast.Module, ScopeAnalyzer]:
+        """
+        Parse and scope-analyze `src`, which is the whole module source (prelude +
+        inputs). Register it in linecache so that error messages can show the
+        source lines.
+        """
+        # An entry without mtime is never invalidated by linecache.checkcache
         linecache.cache[self.filename] = (
             len(src),
             None,
@@ -139,7 +183,57 @@ class ReplSession:
         assert parsed.scoping_rules in ("strict", "pythonic")
         sa = ScopeAnalyzer(self.modname, parsed)
         sa.analyze()
+        return parsed, sa
+
+    def compile(self, inputs: list[str]) -> ast.Module:
+        """
+        Parse, analyze and astcompile the prelude + the repl main containing `inputs`.
+        """
+        if inputs:
+            body = textwrap.indent("\n".join(inputs), "    ") + "\n"
+        else:
+            body = "    pass\n"
+        src = self._module_src(f"\n\ndef {REPL_MAIN}() -> None:\n" + body)
+        parsed, sa = self._scope_analyze(src)
         return astcompile(parsed, scope_analyzer=sa)
+
+    def add_module_input(self, src: str) -> None:
+        """
+        Check a module-scope input and append it to the prelude.
+
+        The input is parsed and scope-analyzed together with the prelude, so that
+        syntax and scoping errors are reported immediately. Nothing is executed:
+        the prelude is only imported by enter_main(). If the check fails, the
+        prelude is left unchanged.
+        """
+        assert self.mode == "module"
+        checked = self._module_src(src)
+        self._scope_analyze(checked)
+        self.prelude = checked
+
+    def load(self, filename: str) -> None:
+        """
+        `%load FILE`: append the content of FILE to the prelude.
+        """
+        self.add_module_input(py.path.local(filename).read_text("utf-8"))
+
+    def enter_main(self) -> None:
+        """
+        Freeze the prelude and switch to main scope: import the prelude as a normal
+        module and create the frame of the repl main, which then stays alive for
+        the rest of the session.
+        """
+        assert self.mode == "module"
+        importer = _ReplImporter(self, self.use_spyc)
+        importer.astcompile_all()
+        importer.import_all()
+
+        w_mod = self.vm.modules_w[self.modname]
+        w_main = w_mod.getattr_maybe(self.vm, REPL_MAIN)
+        assert isinstance(w_main, W_ASTFunc)
+        self.frame = ASTFrame(self.vm, w_main, [])
+        self.frame.declare_arguments()
+        self.mode = "main"
 
     def _load_imports(self, mod: ast.Module) -> None:
         """
@@ -168,7 +262,7 @@ class ReplSession:
 
     def run(self, src: str) -> Optional[str]:
         """
-        Execute one input, which can contain multiple statements.
+        Execute one main-scope input, which can contain multiple statements.
 
         If the input ends with an expression whose value is not None, return its
         repr. Raise SPyError in case of errors.
@@ -177,6 +271,7 @@ class ReplSession:
         the variables are restored to what they were before. Side effects on the
         objects are not undone (e.g. a list which was appended to).
         """
+        assert self.mode == "main" and self.frame is not None
         mod = self.compile(self.inputs + [src])
         self._load_imports(mod)
         funcdef = self._get_repl_main(mod)
@@ -220,6 +315,39 @@ def is_complete(src: str) -> bool:
         return True
 
 
+def run_command(
+    session: ReplSession,
+    line: str,
+    *,
+    out: IO[str],
+    use_colors: bool,
+) -> None:
+    """
+    Execute a REPL command (a line starting with `%`), e.g. `%main` or `%load FILE`.
+    """
+    parts = line.split()
+    cmd, args = parts[0], parts[1:]
+    if cmd in ("%main", "%load") and session.mode == "main":
+        print(f"`{cmd}` is only available in module scope", file=out)
+    elif cmd == "%main":
+        try:
+            session.enter_main()
+        except SPyError as e:
+            print(e.format(use_colors=use_colors), file=out)
+    elif cmd == "%load":
+        if len(args) != 1:
+            print("usage: %load FILE", file=out)
+        else:
+            try:
+                session.load(args[0])
+            except SPyError as e:
+                print(e.format(use_colors=use_colors), file=out)
+            except OSError as e:
+                print(f"cannot load `{args[0]}`: {e.strerror}", file=out)
+    else:
+        print(f"unknown command `{cmd}`", file=out)
+
+
 def run_repl(
     session: ReplSession,
     *,
@@ -242,7 +370,13 @@ def run_repl(
     buf: list[str] = []
     while True:
         try:
-            line = read_line("... " if buf else ">>> ")
+            if buf:
+                prompt = CONT_PROMPT
+            elif session.mode == "module":
+                prompt = MODULE_PROMPT
+            else:
+                prompt = MAIN_PROMPT
+            line = read_line(prompt)
         except EOFError:
             print(file=out)
             return
@@ -253,6 +387,9 @@ def run_repl(
 
         if not buf and line.strip() in EXIT_COMMANDS:
             return
+        if not buf and line.startswith("%"):
+            run_command(session, line.strip(), out=out, use_colors=use_colors)
+            continue
         buf.append(line)
         src = "\n".join(buf)
         if not src.strip():
@@ -263,7 +400,11 @@ def run_repl(
 
         buf.clear()
         try:
-            res = session.run(src)
+            if session.mode == "module":
+                session.add_module_input(src)
+                res = None
+            else:
+                res = session.run(src)
         except SPyError as e:
             print(e.format(use_colors=use_colors), file=out)
         else:
