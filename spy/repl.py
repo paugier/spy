@@ -6,9 +6,10 @@ scope. A REPL has to respect that, so a session has two modes:
 
   1. module scope (prompt `module>>>`): the user types module-scope code:
      imports, `def`, `class` and global assignments. Nothing runs there: each
-     input is checked (parsed and scope-analyzed together with the prelude)
-     and appended to the *prelude*, i.e. the module-scope source code of the
-     session. `%main` freezes the prelude and switches to main scope.
+     input is checked (parsed and scope-analyzed together with the prelude,
+     and its imports are checked) and appended to the *prelude*, i.e. the
+     module-scope source code of the session. `%main` freezes the prelude and
+     switches to main scope.
 
   2. main scope (prompt `>>>`): the user types statements and expressions,
      which run in the live frame of an empty function, the "repl main", living
@@ -54,7 +55,7 @@ import sys
 import textwrap
 import traceback
 from pathlib import Path
-from typing import IO, Any, Callable, Optional
+from typing import IO, Any, Callable, Iterator, Literal, Optional
 
 import py.path
 
@@ -65,7 +66,7 @@ from spy.astcompile import astcompile
 from spy.errors import SPyError
 from spy.location import Loc
 from spy.parser import Parser
-from spy.util import OrderedSet, record_src_in_linecache
+from spy.util import record_src_in_linecache
 from spy.vm.astframe import ASTFrame
 from spy.vm.b import B
 from spy.vm.function import W_ASTFunc, W_BuiltinFunc, W_Func
@@ -193,7 +194,7 @@ class ReplSession:
     filename: str
     modname: str
     prelude: str  # module-scope source code of the session
-    mode: str  # "module" or "main"
+    mode: Literal["module", "main"]
     use_spyc: bool
     inputs: list[str]  # main-scope inputs accepted so far
     n_done: int  # number of compiled stmts, in the repl main, already executed
@@ -433,13 +434,17 @@ class ReplSession:
         Check a module-scope input and append it to the prelude.
 
         The input is parsed and scope-analyzed together with the prelude, so that
-        syntax and scoping errors are reported immediately. Nothing is executed:
-        the prelude is only imported by enter_main(). If the check fails, the
+        syntax and scoping errors are reported immediately, and its imports are
+        checked, so that importing a module which does not exist fails here
+        instead of making every later `%main` fail. Nothing is executed: the
+        prelude is only imported by enter_main(). If the check fails, the
         prelude is left unchanged.
         """
         assert self.mode == "module"
         checked = self._module_src(src)
-        self._scope_analyze(checked)
+        parsed, sa = self._scope_analyze(checked)
+        importer = ImportAnalyzer(self.vm, self.modname, use_spyc=self.use_spyc)
+        importer.check_imports(parsed, sa)
         self.prelude = checked
 
     def load(self, filename: str) -> None:
@@ -537,16 +542,7 @@ class ReplSession:
         normal modules: each input is analyzed as a whole before being executed.
         """
         importer = ImportAnalyzer(self.vm, self.modname, use_spyc=self.use_spyc)
-        importer.queue.clear()
-        importer.deps[self.modname] = OrderedSet()
-        importer.cur_modname = self.modname
-        for implicit in mod.implicit_imports:
-            importer.record_import(self.modname, implicit, node=None)
-        importer.visit(mod)
-        importer.cur_modname = None
-        if importer.queue:
-            importer.astcompile_all()
-            importer.import_all()
+        importer.load_imports(mod)
 
     def _get_frame_funcdef(self, mod: ast.Module) -> ast.FuncDef:
         """

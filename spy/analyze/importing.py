@@ -2,7 +2,7 @@ import os
 import pickle
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import py.path
 
@@ -104,6 +104,7 @@ class ImportAnalyzer:
 
     def __init__(self, vm: "SPyVM", modname: str, use_spyc: bool = True) -> None:
         self.vm = vm
+        self.root_modname = modname
         self.queue = deque([modname])
         self.mods: dict[str, MODULE] = {}
         self.deps: dict[str, OrderedSet[str]] = {}  # modname -> list_of_imports
@@ -508,5 +509,49 @@ class ImportAnalyzer:
         # remember the first Import node which referenced this module
         if node is not None:
             self.importers.setdefault(modname, node)
+
+    # ===========================================================
+    # support for a root module which is not loaded from a file
+    # (e.g. the module of a REPL session)
+
+    def _record_root_module(
+        self, mod: ast.Module, implicit_imports: Iterable[str]
+    ) -> None:
+        """
+        Record the imports declared by `mod` as imports of the root module
+        """
+        self.queue.clear()
+        if self.root_modname not in self.deps:
+            self.deps[self.root_modname] = OrderedSet()
+        self.cur_modname = self.root_modname
+        for imp_modname in implicit_imports:
+            self.record_import(self.root_modname, imp_modname, node=None)
+        self.visit(mod)
+        self.cur_modname = None
+
+    def load_imports(self, mod: ast.Module) -> None:
+        """
+        Compile and import the modules imported by `mod` which are not loaded
+        yet. `mod` must be the root module of this analyzer, and is itself
+        NOT loaded.
+        """
+        self._record_root_module(mod, mod.implicit_imports)
+        if self.queue:
+            self.astcompile_all()
+            self.import_all()
+
+    def check_imports(self, mod: ast.Module, sa: scope.ScopeAnalyzer) -> None:
+        """
+        Like load_imports, but only check that all the modules imported by
+        `mod` exist and compile: nothing is imported. `mod` must be the root
+        module of this analyzer, not loaded from a file, and `sa` the
+        ScopeAnalyzer which analyzed it. Raise W_ImportError if an imported
+        module cannot be found.
+        """
+        self._record_root_module(mod, sa.implicit_imports)
+        self.astcompile_all()
+        for modname, m in self.mods.items():
+            if m is None:
+                self.raise_import_error(modname)
 
     # ===========================================================

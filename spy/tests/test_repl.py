@@ -51,14 +51,14 @@ def make_session(tmp_path):
     return make
 
 
-def bare_session(*, module_scope=False):
+def bare_session(*, module_scope: bool = False) -> ReplSession:
     """
     A session without FILE: it starts with the default prelude only.
     """
     return ReplSession(SPyVM(), None, module_scope=module_scope, use_spyc=False)
 
 
-def run_lines(session, lines):
+def run_lines(session: ReplSession, lines: list) -> tuple[str, list]:
     """
     Run `run_repl` on `session`, feeding it `lines` (an exception class in `lines`
     is raised by the "prompt"); return (output, prompts).
@@ -361,8 +361,8 @@ class TestModuleScope:
             "%load",
             "%load /does/not/exist.spy",
             f"%load {bad}",
-            "import does_not_exist",
-            "%main",  # fails, we stay in module scope
+            "import does_not_exist",  # fails immediately: not added to the prelude
+            "%main",  # works: the bad import did not block the session
             "%reset",  # forgets everything, including `cube`
             "%main",
             "cube(2)",
@@ -376,6 +376,28 @@ class TestModuleScope:
         assert prompts[-2:] == [">>> ", ">>> "]
         assert prompts[-3] == "module>>> "
         assert s.mode == "main"
+
+    def test_bad_import_rejected_at_input_time(self, tmp_path):
+        (tmp_path / "bad2.spy").write_text("import nope\n")
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, None, module_scope=True, use_spyc=False)
+        with pytest.raises(SPyError) as exc:
+            s.add_module_input("import does_not_exist")
+        assert exc.value.etype == "W_ImportError"
+        assert "does_not_exist" in exc.value.format(use_colors=False)
+        assert "import does_not_exist" not in s.prelude
+        # importing a module which imports a missing module is rejected
+        with pytest.raises(SPyError) as exc:
+            s.add_module_input("import bad2")
+        assert exc.value.etype == "W_ImportError"
+        assert "nope" in exc.value.format(use_colors=False)
+        assert "import bad2" not in s.prelude
+        # the session is not blocked
+        s.add_module_input("import math")
+        s.enter_main()
+        assert s.mode == "main"
+        assert s.run("math.sqrt(16.0)") == "4.0"
 
     def test_commands_in_main_scope(self, make_session):
         s = make_session()

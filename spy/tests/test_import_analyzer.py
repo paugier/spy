@@ -4,9 +4,19 @@ import py.path
 import pytest
 
 from spy import ast
-from spy.analyze import importing
+from spy.analyze import importing, scope
 from spy.analyze.importing import SPYC_VERSION, ImportAnalyzer
+from spy.astcompile import astcompile
+from spy.errors import SPyError
+from spy.parser import Parser
 from spy.vm.vm import SPyVM
+
+
+def parse_analyze(modname: str, src: str) -> tuple[ast.Module, scope.ScopeAnalyzer]:
+    mod = Parser(src, f"{modname}.spy").parse()
+    sa = scope.ScopeAnalyzer(modname, mod)
+    sa.analyze()
+    return mod, sa
 
 
 @pytest.mark.usefixtures("init")
@@ -341,3 +351,32 @@ class TestImportAnalyzer:
         assert "main" in analyzer2.cached_mods
         import_list = analyzer2.get_import_list()
         assert import_list == ["_range", "main"]
+
+    def test_check_imports(self):
+        self.write("mod1.spy", "x: i32 = 42")
+        mod, sa = parse_analyze("replmod", "import mod1\nimport nonexistent\n")
+        analyzer = ImportAnalyzer(self.vm, "replmod")
+        with pytest.raises(SPyError) as exc:
+            analyzer.check_imports(mod, sa)
+        assert exc.value.etype == "W_ImportError"
+        assert "nonexistent" in exc.value.w_exc.message
+        assert "mod1" not in self.vm.modules_w
+
+    def test_check_imports_ok(self):
+        self.write("mod1.spy", "x: i32 = 42")
+        mod, sa = parse_analyze("replmod", "import mod1\n")
+        analyzer = ImportAnalyzer(self.vm, "replmod")
+        analyzer.check_imports(mod, sa)  # does not raise
+        assert "mod1" not in self.vm.modules_w  # nothing was imported
+        assert analyzer.mods["mod1"] is not None
+
+    def test_load_imports(self):
+        # load_imports compiles and imports the imports of a root module which
+        # is not loaded from a file, but does not import the root itself
+        self.write("mod1.spy", "x: i32 = 42")
+        mod, sa = parse_analyze("replmod", "import mod1\n")
+        compiled = astcompile(mod, scope_analyzer=sa)
+        analyzer = ImportAnalyzer(self.vm, "replmod")
+        analyzer.load_imports(compiled)
+        assert "mod1" in self.vm.modules_w
+        assert "replmod" not in self.vm.modules_w
