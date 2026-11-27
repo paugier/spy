@@ -141,6 +141,7 @@ class W_Traceback(W_Object):
             ## co_name = frame.f_code.co_name
             if frame.f_code in (
                 ASTFrame.run.__code__,
+                ASTFrame.run_interactive.__code__,
                 ModFrame.run.__code__,
                 ClassFrame.run.__code__,
                 DopplerFrame.redshift.__code__,

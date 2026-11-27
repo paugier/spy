@@ -11,6 +11,7 @@ from spy.cli.commands.imports import imports
 from spy.cli.commands.parse import parse
 from spy.cli.commands.pyparse import pyparse
 from spy.cli.commands.redshift import redshift
+from spy.cli.commands.repl import repl
 from spy.cli.commands.scopes import scopes
 from spy.cli.spy_typer import SpyGroupConfig, SpyTyper
 
@@ -30,6 +31,7 @@ app = SpyTyper(
 
 app.spy_command(execute, name="execute", default=True, strict_argv=True)
 app.spy_command(build, name="build", strict_argv=True)
+app.spy_command(repl, name="repl")
 app.spy_command(redshift, name="redshift | rs", strict_argv=True)
 app.spy_command(colorize, name="colorize")
 app.spy_command(astcompile, name="astcompile")

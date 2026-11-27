@@ -15,3 +15,11 @@ def pyproject_entry_point() -> Any:
         )
         sys.exit(1)
     return app()
+
+
+def ispy_entry_point() -> Any:
+    """
+    `ispy FILENAME` is a shortcut for `spy repl FILENAME`
+    """
+    sys.argv.insert(1, "repl")
+    return pyproject_entry_point()

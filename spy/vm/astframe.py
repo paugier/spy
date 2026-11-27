@@ -1325,6 +1325,23 @@ class ASTFrame(AbstractFrame):
         except Return as e:
             return e.w_value
 
+    def run_interactive(self, block: ast.Block) -> Optional[W_MetaArg]:
+        """
+        Execute `block` in this frame. This is the entry point used by
+        the REPL (see spy/repl.py).
+
+        If the last statement is an expression, return its value instead of
+        discarding it, so that the REPL can display it.
+        """
+        stmts = block.body
+        last = stmts[-1] if stmts else None
+        if isinstance(last, ast.StmtExpr):
+            block = block.replace(body=stmts[:-1])
+        self.exec_Block(block)
+        if isinstance(last, ast.StmtExpr):
+            return self.eval_expr(last.value)
+        return None
+
     def declare_arguments(self) -> None:
         w_ft = self.w_func.w_functype
         funcdef = self.funcdef

@@ -54,6 +54,7 @@ Homepage = "https://github.com/spylang/spy"
 
 [project.scripts]
 spy = "spy.cli:pyproject_entry_point"
+ispy = "spy.cli:ispy_entry_point"
 
 [build-system]
 requires = ["setuptools"]
