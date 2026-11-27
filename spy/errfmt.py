@@ -63,7 +63,11 @@ class ErrorFormatter:
         This is used by emit_traceback, but also by spdb.do_where.
         """
         if f.kind == "astframe":
-            where = str(f.fqn)
+            if f.loc.filename.startswith("<"):
+                # the code does not come from a file (REPL)
+                where = f.loc.filename
+            else:
+                where = str(f.fqn)
         elif f.kind == "modframe":
             where = f"[module] {f.fqn}"
         elif f.kind == "classframe":

@@ -696,3 +696,198 @@ class TestRepl:
         res = CliRunner().invoke(app, ["-i", str(f), "a", "b"], input="n\nexit\n")
         assert res.exit_code == 0, res.output
         assert ">>> 3\n" in res.stdout
+
+    # history file
+
+    def test_history_file(self, make_session, tmp_path, monkeypatch):
+        import builtins
+        import readline
+
+        readline.clear_history()
+        hf = tmp_path / "ispy_history"
+        lines = iter(["1 + 1", "x = 3", "exit"])
+        monkeypatch.setattr(builtins, "input", lambda prompt="": next(lines))
+        s = make_session()
+        out = StringIO()
+        run_repl(s, out=out, use_colors=False, history_file=hf)
+        assert out.getvalue() == "2\n"
+        # the history was saved to the file, and can be read back
+        assert hf.exists()
+        readline.clear_history()
+        readline.read_history_file(str(hf))
+        n = readline.get_current_history_length()
+        items = [readline.get_history_item(i) for i in range(1, n + 1)]
+        assert items == ["1 + 1", "x = 3", "exit"]
+
+    # tracebacks show <repl>
+
+    def test_traceback_shows_repl(self, tmp_path):
+        f = tmp_path / "mymod.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def boom() -> None:
+                    raise ValueError('boom')
+                """
+            )
+        )
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, f, use_spyc=False)
+        with pytest.raises(SPyError) as exc:
+            s.run("boom()")
+        out = exc.value.format(use_colors=False)
+        # the frame of the input shows <repl>, with a line number relative to
+        # the inputs, and the corresponding source line
+        assert "  * <repl> at <repl>:1\n" in out
+        assert "boom()" in out
+        # the frame of boom() still points to the FILE
+        assert f"  * mymod::boom at {f}:" in out
+
+    def test_traceback_shows_repl_no_file(self):
+        s = ReplSession(SPyVM(), None, use_spyc=False)
+        with pytest.raises(SPyError) as exc:
+            s.run("raise ValueError('boom')")
+        out = exc.value.format(use_colors=False)
+        assert "  * <repl> at <repl>:" in out
+        assert "raise ValueError('boom')" in out
+
+    def test_traceback_shows_repl_x_mode(self, make_x_session):
+        s = make_x_session(
+            """
+            def main() -> None:
+                x = 1
+            """
+        )
+        with pytest.raises(SPyError) as exc:
+            s.run("raise ValueError('boom')")
+        out = exc.value.format(use_colors=False)
+        assert "  * <repl> at <repl>:1\n" in out
+
+    def test_static_error_shows_repl(self, make_session):
+        s = make_session()
+        with pytest.raises(SPyError) as exc:
+            s.run("undefined_name + 1")
+        out = exc.value.format(use_colors=False)
+        assert "<repl>:1" in out
+        assert "undefined_name + 1" in out
+
+    def test_error_in_loop_shows_repl(self, make_session):
+        s = make_session()
+        out, _ = run_lines(s, ["raise ValueError('boom')", "1 + 1"])
+        assert "<repl>" in out
+        assert out.rstrip().endswith("2")
+
+    # complete() and inspect()
+
+    def test_complete_plain_names(self, make_session):
+        s = make_session()
+        assert s.complete("squa") == ["square"]
+        assert s.complete("mai") == ["main"]
+        assert "print" in s.complete("pri")
+        s.run("x = 3")
+        assert s.complete("x") == ["x"]
+
+    def test_complete_attribute_chain(self, tmp_path):
+        f = tmp_path / "m.spy"
+        f.write_text("import math\n")
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, f, use_spyc=False)
+        assert s.complete("math.sq") == ["math.sqrt"]
+        assert s.complete("math.sqrt") == ["math.sqrt"]
+        assert "math.pi" in s.complete("math.p")
+        # names starting with `_` are proposed only if explicitly requested
+        assert all(
+            not c.rpartition(".")[2].startswith("_") for c in s.complete("math.")
+        )
+
+    def test_complete_instance_attributes(self, make_session):
+        s = make_session()
+        s.run("w = [1, 2, 3]")
+        assert s.complete("w.ap") == ["w.append"]
+        assert "w.append" in s.complete("w.")
+
+    def test_complete_in_module_scope(self):
+        s = ReplSession(SPyVM(), None, module_scope=True, use_spyc=False)
+        # the prelude is not imported yet: only builtins are visible
+        assert "print" in s.complete("pri")
+        with pytest.raises(SPyError) as exc:
+            s.inspect("nosuch")
+        assert exc.value.etype == "W_NameError"
+
+    def test_complete_never_evaluates_calls(self, tmp_path, capsys):
+        f = tmp_path / "m.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def side_effect() -> i32:
+                    print('SIDE EFFECT')
+                    return 1
+                """
+            )
+        )
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, f, use_spyc=False)
+        assert s.complete("side_eff") == ["side_effect"]
+        with pytest.raises(SPyError) as exc:
+            s.complete("side_effect().")
+        assert exc.value.etype == "W_TypeError"
+        # nothing was executed
+        assert capsys.readouterr().out == ""
+
+    def test_inspect_function(self, tmp_path):
+        f = tmp_path / "m.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def square(x: i32) -> i32:
+                    "return the square of x"
+                    return x * x
+                """
+            )
+        )
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, f, use_spyc=False)
+        out = s.inspect("square")
+        assert "def square(i32) -> i32" in out
+        assert "return the square of x" in out
+
+    def test_inspect_module_type_and_value(self, tmp_path):
+        f = tmp_path / "m.spy"
+        f.write_text("import math\n")
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        s = ReplSession(vm, f, use_spyc=False)
+        assert s.inspect("math") == "module math"
+        assert s.inspect("math.sqrt").startswith("def math.sqrt(")
+        assert s.inspect("i32") == "type i32"
+        s.run("x = 3")
+        assert s.inspect("x") == "type: i32"
+
+    def test_inspect_rejects_calls(self, make_session):
+        s = make_session()
+        with pytest.raises(SPyError) as exc:
+            s.inspect("square(3)")
+        assert exc.value.etype == "W_TypeError"
+        assert "cannot evaluate `square(3)`" in exc.value.w_exc.message
+
+    def test_readline_completer(self, make_session):
+        from spy.repl import _make_completer
+
+        s = make_session()
+        completer = _make_completer(s)
+        assert completer("squa", 0) == "square"
+        assert completer("squa", 1) is None
+
+    # ? help in the loop
+
+    def test_question_mark_help(self, make_session):
+        s = make_session()
+        out, _ = run_lines(s, ["?square", "square?", "?", "?nosuch", "1 + 1"])
+        assert out.count("def square(i32) -> i32") == 2
+        assert "usage: ?NAME or NAME?" in out
+        assert "NameError: name `nosuch` is not defined" in out
+        assert out.rstrip().endswith("2")

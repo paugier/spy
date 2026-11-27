@@ -32,15 +32,26 @@ plus the repl main whose body is made of all the inputs accepted so far, plus
 the new input). This is simple and gives the correct scoping for free. Then we
 execute in the live frame only the statements which are new. In `-x` mode the
 inputs are appended to the body of `main` instead, and executed in its frame.
+
+When the session is based on a FILE, the locs of the inputs are rewritten to
+point to the pseudo-file `<repl>`, with line numbers relative to the inputs
+themselves: tracebacks and error messages about the inputs show `<repl>`,
+not the FILE and the line numbers of the combined source.
+
+The interactive loop (run_repl) uses readline when available: line editing,
+a history file (HISTORY_FILE, like ~/.python_history for python) and tab
+completion (see ReplSession.complete). Lines starting with `?` (or ending
+with `?`) print help about a name: see ReplSession.inspect.
 """
 
 import codeop
 import copy
+import dataclasses
 import linecache
 import sys
 import textwrap
 from pathlib import Path
-from typing import IO, Callable, Optional
+from typing import IO, Any, Callable, Optional
 
 import py.path
 
@@ -51,17 +62,24 @@ from spy.astcompile import astcompile
 from spy.errors import SPyError
 from spy.location import Loc
 from spy.parser import Parser
-from spy.util import OrderedSet
+from spy.util import OrderedSet, record_src_in_linecache
 from spy.vm.astframe import ASTFrame
 from spy.vm.b import B
-from spy.vm.function import W_ASTFunc
+from spy.vm.function import W_ASTFunc, W_BuiltinFunc, W_Func
 from spy.vm.module import W_Module
-from spy.vm.object import W_Object
+from spy.vm.object import W_Object, W_Type
 from spy.vm.vm import SPyVM
 
 # Name of the function whose frame is used by the session. FILE is free to define its
 # own `main`, which the user can then call from the REPL.
 REPL_MAIN = "__repl_main__"
+
+# Pseudo-filename shown in tracebacks and error messages for the inputs typed
+# at the prompt (as opposed to the prelude, which keeps its real filename).
+REPL_FILENAME = "<repl>"
+
+# Default history file of `ispy`.
+HISTORY_FILE = Path.home() / ".ispy_history"
 
 # Module-scope source code which every session starts with, so that the prompt is
 # usable without ceremony. Literals (list, tuple, dict, ...) do not need an import:
@@ -82,6 +100,49 @@ def _ensure_nl(src: str) -> str:
     if src and not src.endswith("\n"):
         return src + "\n"
     return src
+
+
+def _matches(name: str, prefix: str) -> bool:
+    """
+    Whether `name` is a completion candidate for `prefix`. Names starting with
+    `_` are proposed only if the user explicitly typed a leading `_`.
+    """
+    if not name.startswith(prefix):
+        return False
+    return prefix.startswith("_") or not name.startswith("_")
+
+
+def _shifted_loc(loc: Loc, filename: str, line_offset: int) -> Loc:
+    return Loc(
+        filename,
+        loc.line_start - line_offset,
+        loc.line_end - line_offset,
+        loc.col_start,
+        loc.col_end,
+        loc.colorize,
+    )
+
+
+def _rewrite_locs(node: ast.Node, filename: str, line_offset: int) -> ast.Node:
+    """
+    Return a copy of `node` and its descendants in which every loc points to
+    `filename`, with line numbers shifted by `line_offset`.
+    """
+    changes: dict[str, Any] = {"loc": _shifted_loc(node.loc, filename, line_offset)}
+    for f in dataclasses.fields(node):
+        if f.name == "loc":
+            continue
+        value = getattr(node, f.name)
+        if isinstance(value, ast.Node):
+            changes[f.name] = _rewrite_locs(value, filename, line_offset)
+        elif isinstance(value, list):
+            changes[f.name] = [
+                _rewrite_locs(item, filename, line_offset)
+                if isinstance(item, ast.Node)
+                else item
+                for item in value
+            ]
+    return node.replace(**changes)
 
 
 class _ReplImporter(ImportAnalyzer):
@@ -150,7 +211,7 @@ class ReplSession:
             self.modname = filename.stem
             file_src = filename.read_text()
         else:
-            self.filename = "<repl>"
+            self.filename = REPL_FILENAME
             self.modname = "repl"
             file_src = ""
         self.use_spyc = use_spyc
@@ -186,11 +247,11 @@ class ReplSession:
             src = _ensure_nl(src) + _ensure_nl(extra)
         return src
 
-    def _scope_analyze(self, src: str) -> tuple[ast.Module, ScopeAnalyzer]:
+    def _parse(self, src: str) -> ast.Module:
         """
-        Parse and scope-analyze `src`, which is the whole module source (prelude +
-        inputs). Register it in linecache so that error messages can show the
-        source lines.
+        Parse `src`, which is the whole module source (prelude + inputs).
+        Register it in linecache so that error messages can show the source
+        lines.
         """
         # An entry without mtime is never invalidated by linecache.checkcache
         linecache.cache[self.filename] = (
@@ -199,7 +260,14 @@ class ReplSession:
             src.splitlines(keepends=True),
             self.filename,
         )
-        parsed = Parser(src, self.filename).parse()
+        return Parser(src, self.filename).parse()
+
+    def _scope_analyze(self, src: str) -> tuple[ast.Module, ScopeAnalyzer]:
+        """
+        Parse and scope-analyze `src`, which is the whole module source (prelude +
+        inputs).
+        """
+        parsed = self._parse(src)
         assert parsed.scoping_rules in ("strict", "pythonic")
         sa = ScopeAnalyzer(self.modname, parsed)
         sa.analyze()
@@ -209,27 +277,57 @@ class ReplSession:
         """
         Parse, analyze and astcompile the prelude + the repl main containing `inputs`
         (or, in -x mode, the prelude with `inputs` appended to the body of `main`).
+
+        When the session is based on a FILE, the locs of the inputs are rewritten
+        to point to the pseudo-file `<repl>` (see _localize_inputs), so that
+        tracebacks and error messages about the inputs show `<repl>` instead of
+        the FILE and the line numbers of the combined source.
         """
         if self.run_main is not None:
-            src = self._main_src(inputs)
+            src, offset, n_orig = self._main_src(inputs)
         else:
-            if inputs:
-                body = textwrap.indent("\n".join(inputs), "    ") + "\n"
-            else:
-                body = "    pass\n"
-            src = self._module_src(f"\n\ndef {REPL_MAIN}() -> None:\n" + body)
-        parsed, sa = self._scope_analyze(src)
+            src, offset, n_orig = self._repl_main_src(inputs)
+        parsed = self._parse(src)
+        if inputs and self.filename != REPL_FILENAME:
+            parsed = self._localize_inputs(parsed, offset, n_orig)
+            self._record_repl_src(inputs)
+        assert parsed.scoping_rules in ("strict", "pythonic")
+        sa = ScopeAnalyzer(self.modname, parsed)
+        sa.analyze()
         return astcompile(parsed, scope_analyzer=sa)
 
-    def _main_src(self, inputs: list[str]) -> str:
+    def _inputs_body(self, inputs: list[str]) -> str:
+        """
+        The source of the inputs, indented to fit in the body of a function.
+        """
+        return "".join(textwrap.indent(_ensure_nl(src), "    ") for src in inputs)
+
+    def _repl_main_src(self, inputs: list[str]) -> tuple[str, int, int]:
+        """
+        The whole module source in main mode: the prelude, plus the repl main
+        whose body is made of `inputs`. Returns (src, offset, n_orig): `offset`
+        is the number of lines of `src` which precede the inputs (input line 1
+        is at line offset+1 of `src`), and n_orig is 0, because the whole body
+        of the repl main comes from the inputs.
+        """
+        if inputs:
+            body = self._inputs_body(inputs)
+        else:
+            body = "    pass\n"
+        head = self._module_src(f"\n\ndef {REPL_MAIN}() -> None:\n")
+        return head + body, head.count("\n"), 0
+
+    def _main_src(self, inputs: list[str]) -> tuple[str, int, int]:
         """
         The whole module source in -x mode: the prelude, with `inputs` appended
         to the body of `main`, so that they are scope-analyzed (and then
-        executed) as part of `main`, in its frame.
+        executed) as part of `main`, in its frame. Returns (src, offset, n_orig):
+        `offset` is the number of lines of `src` which precede the appended
+        inputs, and n_orig is the number of stmts of the original body of `main`.
         """
         src = self._module_src()
         if not inputs:
-            return src
+            return src, 0, 0
         parsed = Parser(src, self.filename).parse()
         funcdef: Optional[ast.FuncDef] = None
         for decl in parsed.decls:
@@ -238,10 +336,9 @@ class ReplSession:
                 break
         if funcdef is None:
             raise SPyError("W_TypeError", f"`{self.filename}` does not define `main`")
+        n_orig = len(funcdef.body.body)
         lines = src.splitlines(keepends=True)
-        injected = "".join(
-            textwrap.indent(_ensure_nl(src_input), "    ") for src_input in inputs
-        )
+        injected = self._inputs_body(inputs)
         body = funcdef.body.body
         first = body[0] if body else None
         if first is not None and first.loc.line_start == funcdef.loc.line_start:
@@ -251,14 +348,49 @@ class ReplSession:
             line = lines[ln - 1]
             col = first.loc.col_start
             mid = line[:col] + "\n" + textwrap.indent(line[col:], "    ") + injected
-            return "".join(lines[: ln - 1]) + mid + "".join(lines[ln:])
+            # the injected inputs start at line ln+2
+            return "".join(lines[: ln - 1]) + mid + "".join(lines[ln:]), ln + 1, n_orig
         # insert right after the last line of `main` (lines are 1-based and
         # line_end is inclusive, so the insertion index is line_end itself)
         end = funcdef.loc.line_end
         prefix = "".join(lines[:end])
         if not prefix.endswith("\n"):
             prefix += "\n"
-        return prefix + injected + "".join(lines[end:])
+        # the injected inputs start at line end+1
+        return prefix + injected + "".join(lines[end:]), end, n_orig
+
+    def _localize_inputs(self, mod: ast.Module, offset: int, n_orig: int) -> ast.Module:
+        """
+        Rewrite the locs of the inputs (the body of the repl main, or the stmts
+        appended to `main` in -x mode) to point to the pseudo-file `<repl>`,
+        with line numbers relative to the inputs themselves.
+        """
+        name = "main" if self.run_main is not None else REPL_MAIN
+        decls: list[ast.Decl] = []
+        for decl in mod.decls:
+            if isinstance(decl, ast.GlobalFuncDef) and decl.funcdef.name == name:
+                funcdef = decl.funcdef
+                body = funcdef.body.body
+                new_stmts = body[:n_orig] + [
+                    _rewrite_locs(stmt, REPL_FILENAME, offset) for stmt in body[n_orig:]
+                ]
+                new_funcdef = funcdef.replace(body=funcdef.body.replace(body=new_stmts))
+                decl = decl.replace(funcdef=new_funcdef)
+            decls.append(decl)
+        return mod.replace(decls=decls)
+
+    def _record_repl_src(self, inputs: list[str]) -> None:
+        """
+        Register the source of the inputs in linecache under `<repl>`, so that
+        error messages can show the corresponding source lines.
+        """
+        src = self._inputs_body(inputs)
+        linecache.cache[REPL_FILENAME] = (
+            len(src),
+            None,
+            src.splitlines(keepends=True),
+            REPL_FILENAME,
+        )
 
     def add_module_input(self, src: str) -> None:
         """
@@ -343,7 +475,7 @@ class ReplSession:
         default prelude. A fresh module name is used, because a module which
         has already been imported cannot be redefined.
         """
-        self.filename = "<repl>"
+        self.filename = REPL_FILENAME
         self.modname = self._fresh_modname()
         self.prelude = DEFAULT_PRELUDE
         self.mode = "module"
@@ -432,6 +564,156 @@ class ReplSession:
         wam_s = self.vm.repr_wam(wam, loc=Loc.here())
         return self.vm.unwrap_str(wam_s.w_val)
 
+    # === tab completion and ? help ===
+
+    def complete(self, prefix: str) -> list[str]:
+        """
+        Return the completions for `prefix`: plain names visible in the session
+        (locals of the live frame, globals of the session module, builtins), or,
+        if `prefix` contains a dot, the attributes of the object designated by
+        the part before the last dot, e.g. `math.sq` -> `['math.sqrt']`.
+
+        Only plain names and attribute chains are evaluated (see _eval_chain),
+        so completing never has side effects.
+        """
+        if "." in prefix:
+            base, _, attr_prefix = prefix.rpartition(".")
+            w_obj = self._eval_chain(base)
+            return sorted(
+                f"{base}.{attr}"
+                for attr in self._dir(w_obj)
+                if _matches(attr, attr_prefix)
+            )
+        return sorted(name for name in self._visible_names() if _matches(name, prefix))
+
+    def inspect(self, name: str) -> str:
+        """
+        `?name`: return a help string about `name`, which must be a plain name
+        or an attribute chain (e.g. `?math.sqrt`).
+        """
+        w_obj = self._eval_chain(name)
+        vm = self.vm
+        if isinstance(w_obj, W_Func):
+            w_ft = w_obj.w_functype
+            if w_ft.kind == "metafunc":
+                # the w_functype of a metafunc is its interp-level signature,
+                # which is not what the user wants to see
+                sig = f"def {name}(...)"
+            else:
+                # NOTE: use w_ft.params and not all_params(), which is infinite
+                # in case of varargs
+                params = ", ".join(
+                    ("*" if p.kind == "var_positional" else "")
+                    + p.w_T.fqn.human_name(vm)
+                    for p in w_ft.params
+                )
+                ret = w_ft.w_restype.fqn.human_name(vm)
+                sig = f"def {name}({params}) -> {ret}"
+            lines = [sig, str(w_obj.fqn)]
+            docstring: Optional[str] = None
+            if isinstance(w_obj, W_ASTFunc):
+                docstring = w_obj.funcdef.docstring
+            elif isinstance(w_obj, W_BuiltinFunc):
+                docstring = w_obj._pyfunc.__doc__
+            if docstring:
+                lines += ["", docstring.strip()]
+            return "\n".join(lines)
+        elif isinstance(w_obj, W_Module):
+            return f"module {w_obj.name}"
+        elif isinstance(w_obj, W_Type):
+            return f"type {w_obj.fqn.human_name(vm)}"
+        else:
+            w_T = vm.dynamic_type(w_obj)
+            return f"type: {w_T.fqn.human_name(vm)}"
+
+    def _visible_names(self) -> set[str]:
+        names: set[str] = set()
+        frame = self.frame
+        if frame is not None:
+            for slot_name, lv in frame.locals.items():
+                if lv.w_val is None:
+                    continue
+                sym = frame.frameinfo.lookup_maybe(slot_name)
+                names.add(sym.src_name if sym is not None else slot_name)
+        for modname in (self.modname, "builtins"):
+            w_mod = self.vm.modules_w.get(modname)
+            if w_mod is not None:
+                names.update(w_mod.keys())
+        return names
+
+    def _eval_chain(self, src: str) -> W_Object:
+        """
+        Evaluate `src`, which must be a plain name or an attribute chain such as
+        `math.sqrt`. Anything else (function calls, subscripts, operators, ...)
+        is rejected: this guarantees that completing and inspecting never have
+        side effects.
+        """
+        filename = record_src_in_linecache(src, name="repl-eval")
+        stmt = Parser(src, filename).parse_single_stmt()
+        node: Optional[ast.Expr] = (
+            stmt.value if isinstance(stmt, ast.StmtExpr) else None
+        )
+        attrs: list[str] = []
+        while node is not None and isinstance(node, ast.GetAttr):
+            attrs.append(node.attr.value)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            raise SPyError.simple(
+                "W_TypeError",
+                f"cannot evaluate `{src}`",
+                "only plain names and attribute chains are allowed",
+                stmt.loc,
+            )
+        w_obj = self._lookup_name(node.id)
+        if w_obj is None:
+            raise SPyError("W_NameError", f"name `{node.id}` is not defined")
+        for attr in reversed(attrs):
+            w_attr = self._getattr_maybe(w_obj, attr)
+            if w_attr is None:
+                t = self.vm.dynamic_type(w_obj).fqn.human_name(self.vm)
+                raise SPyError("W_TypeError", f"type `{t}` has no attribute `{attr}`")
+            w_obj = w_attr
+        return w_obj
+
+    def _lookup_name(self, name: str) -> Optional[W_Object]:
+        """
+        Resolve a plain name roughly like the repl main would: locals of the
+        live frame first, then the globals of the session module, then builtins.
+        """
+        frame = self.frame
+        if frame is not None:
+            for slot_name, lv in frame.locals.items():
+                if lv.w_val is None:
+                    continue
+                sym = frame.frameinfo.lookup_maybe(slot_name)
+                if sym is not None and sym.src_name == name:
+                    return lv.w_val
+        for modname in (self.modname, "builtins"):
+            w_mod = self.vm.modules_w.get(modname)
+            if w_mod is not None:
+                w_obj = w_mod.getattr_maybe(self.vm, name)
+                if w_obj is not None:
+                    return w_obj
+        return None
+
+    def _getattr_maybe(self, w_obj: W_Object, attr: str) -> Optional[W_Object]:
+        """
+        Attribute lookup which never executes any code: modules are plain dicts,
+        and for other objects we look into the dict of their type.
+        """
+        if isinstance(w_obj, W_Module):
+            return w_obj.getattr_maybe(self.vm, attr)
+        w_T = self.vm.dynamic_type(w_obj)
+        w_attr = w_T.lookup(self.vm, attr)
+        if w_attr is None and isinstance(w_obj, W_Type):
+            w_attr = w_obj.lookup(self.vm, attr)
+        return w_attr
+
+    def _dir(self, w_obj: W_Object) -> set[str]:
+        names = self.vm.dynamic_type(w_obj).spy_dir(self.vm)
+        names.update(w_obj.spy_dir(self.vm))
+        return names
+
 
 def is_complete(src: str) -> bool:
     """
@@ -481,23 +763,87 @@ def run_command(
         print(f"unknown command `{cmd}`", file=out)
 
 
+def run_help(session: ReplSession, arg: str, *, out: IO[str]) -> None:
+    """
+    `?NAME` (or `NAME?`): print help about NAME. See ReplSession.inspect.
+    """
+    arg = arg.strip()
+    if not arg:
+        print("usage: ?NAME or NAME?", file=out)
+        return
+    try:
+        print(session.inspect(arg), file=out)
+    except SPyError as e:
+        print(f"{e.etype[2:]}: {e.w_exc.message}", file=out)
+
+
+def _make_completer(session: ReplSession) -> Callable[[str, int], Optional[str]]:
+    """
+    A readline completer based on session.complete.
+    """
+    matches: list[str] = []
+
+    def completer(text: str, state: int) -> Optional[str]:
+        nonlocal matches
+        if state == 0:
+            try:
+                matches = session.complete(text)
+            except SPyError:
+                matches = []
+        if 0 <= state < len(matches):
+            return matches[state]
+        return None
+
+    return completer
+
+
+def _read_history_file(readline: Any, history_file: Path) -> None:
+    try:
+        readline.read_history_file(str(history_file))
+    except OSError:
+        pass  # no history yet
+
+
+def _write_history_file(readline: Any, history_file: Path) -> None:
+    try:
+        readline.write_history_file(str(history_file))
+    except OSError:
+        pass  # e.g. a read-only home directory: history is best-effort
+
+
 def run_repl(
     session: ReplSession,
     *,
     read_line: Optional[Callable[[str], str]] = None,
     out: Optional[IO[str]] = None,
     use_colors: bool = True,
+    history_file: Optional[Path] = HISTORY_FILE,
 ) -> None:
     """
     The interactive loop. `read_line` and `out` can be overridden for testing.
+
+    When `read_line` is not given, the real `input()` is used, with readline
+    enabled: line editing, tab completion (see ReplSession.complete) and a
+    history file (`history_file`, pass None to disable it).
     """
     if out is None:
         out = sys.stdout
+    readline_mod: Any = None
     if read_line is None:
         try:
-            import readline  # noqa: F401  # enables line editing/history in input()
+            import readline  # enables line editing/history in input()
         except ImportError:
             pass
+        else:
+            readline_mod = readline
+            # cap the history, so that the file does not grow without bounds
+            readline_mod.set_history_length(1000)
+            if history_file is not None:
+                _read_history_file(readline_mod, history_file)
+            # '.' must NOT be a word delimiter: `math.sq` is completed as a whole
+            readline_mod.set_completer_delims(" \t\n()[]{}'\",:;")
+            readline_mod.set_completer(_make_completer(session))
+            readline_mod.parse_and_bind("tab: complete")
         read_line = input
 
     if session.main_error is not None:
@@ -506,45 +852,62 @@ def run_repl(
         print(session.main_error.format(use_colors=use_colors), file=out)
 
     buf: list[str] = []
-    while True:
-        try:
-            if buf:
-                prompt = CONT_PROMPT
-            elif session.mode == "module":
-                prompt = MODULE_PROMPT
-            else:
-                prompt = MAIN_PROMPT
-            line = read_line(prompt)
-        except EOFError:
-            print(file=out)
-            return
-        except KeyboardInterrupt:
-            print("\nKeyboardInterrupt", file=out)
-            buf.clear()
-            continue
+    try:
+        while True:
+            try:
+                if buf:
+                    prompt = CONT_PROMPT
+                elif session.mode == "module":
+                    prompt = MODULE_PROMPT
+                else:
+                    prompt = MAIN_PROMPT
+                line = read_line(prompt)
+            except EOFError:
+                print(file=out)
+                return
+            except KeyboardInterrupt:
+                print("\nKeyboardInterrupt", file=out)
+                buf.clear()
+                continue
 
-        if not buf and line.strip() in EXIT_COMMANDS:
-            return
-        if not buf and line.startswith("%"):
-            run_command(session, line.strip(), out=out, use_colors=use_colors)
-            continue
-        buf.append(line)
-        src = "\n".join(buf)
-        if not src.strip():
-            buf.clear()
-            continue
-        if not is_complete(src):
-            continue
+            if readline_mod is not None and line.strip():
+                readline_mod.add_history(line)
 
-        buf.clear()
-        try:
-            if session.mode == "module":
-                session.add_module_input(src)
-                res = None
+            if not buf and line.strip() in EXIT_COMMANDS:
+                return
+            if not buf and line.startswith("?"):
+                run_help(session, line[1:], out=out)
+                continue
+            if (
+                not buf
+                and not line.startswith(("%", "?"))
+                and line.rstrip().endswith("?")
+            ):
+                run_help(session, line.rstrip()[:-1], out=out)
+                continue
+            if not buf and line.startswith("%"):
+                run_command(session, line.strip(), out=out, use_colors=use_colors)
+                continue
+            buf.append(line)
+            src = "\n".join(buf)
+            if not src.strip():
+                buf.clear()
+                continue
+            if not is_complete(src):
+                continue
+
+            buf.clear()
+            try:
+                if session.mode == "module":
+                    session.add_module_input(src)
+                    res = None
+                else:
+                    res = session.run(src)
+            except SPyError as e:
+                print(e.format(use_colors=use_colors), file=out)
             else:
-                res = session.run(src)
-        except SPyError as e:
-            print(e.format(use_colors=use_colors), file=out)
-        else:
-            if res is not None:
-                print(res, file=out)
+                if res is not None:
+                    print(res, file=out)
+    finally:
+        if readline_mod is not None and history_file is not None:
+            _write_history_file(readline_mod, history_file)
