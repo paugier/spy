@@ -178,11 +178,6 @@ class TestTracebacks:
         assert "  * <repl> at <repl>:" in out
         assert "raise ValueError('boom')" in out
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="without FILE the locs are not shifted: we get <repl>:5 (the line "
-        "in prelude + repl main), not <repl>:1 like with a FILE",
-    )
     def test_no_file_line_numbers_are_relative_to_the_inputs(self):
         s = bare_session()
         with pytest.raises(SPyError) as exc:
@@ -219,6 +214,40 @@ class TestRunRepl:
             == [">>> "] * 4 + ["... "] * 2 + [">>> "] * 3 + ["... "] + [">>> "] * 2
         )
 
+    def test_interrupt_during_execution(self, monkeypatch):
+        # ^C while an input is running does not kill the REPL: the input is
+        # dropped and the session stays alive
+        s = bare_session()
+        orig_run = s.run
+
+        def run(src):
+            if src.startswith("while True:"):
+                raise KeyboardInterrupt
+            return orig_run(src)
+
+        monkeypatch.setattr(s, "run", run)
+        out, _ = run_lines(s, ["x = 1", "while True:", "    pass", "", "x", "exit"])
+        assert "\nKeyboardInterrupt\n" in out
+        assert out.rstrip().endswith("1")
+
+    def test_internal_error_during_execution(self, monkeypatch):
+        # a non-SPyError exception during the execution of an input (an
+        # internal bug) is shown as a traceback, and does not kill the REPL
+        s = bare_session()
+        orig_run = s.run
+
+        def run(src):
+            if src == "bug":
+                raise RecursionError("maximum recursion depth exceeded")
+            return orig_run(src)
+
+        monkeypatch.setattr(s, "run", run)
+        out, _ = run_lines(s, ["1 + 1", "bug", "2 + 2", "exit"])
+        assert out.startswith("2\n")
+        assert "Traceback (most recent call last)" in out
+        assert "RecursionError: maximum recursion depth exceeded" in out
+        assert out.rstrip().endswith("4")
+
     def test_question_mark_help(self, make_session):
         s = make_session()
         out, _ = run_lines(s, ["?square", "square?", "?", "?nosuch", "1 + 1"])
@@ -226,6 +255,16 @@ class TestRunRepl:
         assert "usage: ?NAME or NAME?" in out
         assert "NameError: name `nosuch` is not defined" in out
         assert out.rstrip().endswith("2")
+
+    def test_question_mark_only_for_names(self, make_session):
+        s = make_session()
+        out, _ = run_lines(s, ["x = 1  # why?", "x", "1 + 1?", "square?", "exit"])
+        # `x = 1  # why?` ends with `?` but is executed as normal code
+        assert out.startswith("1\n")
+        # `1 + 1?` is not a name either: SPy reports the syntax error
+        assert "ParseError" in out
+        # `square?` is still a help request
+        assert "def square(i32) -> i32" in out
 
     def test_history_file(self, make_session, tmp_path, monkeypatch):
         readline.clear_history()
@@ -252,7 +291,7 @@ class TestModuleScope:
     def test_workflow(self):
         s = bare_session(module_scope=True)
         assert s.mode == "module"
-        assert s.filename == "<repl>"
+        assert s.filename == "<repl:prelude>"
         assert s.prelude == DEFAULT_PRELUDE
         # the prelude is not imported yet: only builtins are visible
         assert "print" in s.complete("pri")
@@ -354,7 +393,7 @@ class TestReset:
         s.run("x = 3")
         s.reset()
         assert s.mode == "module"
-        assert s.filename == "<repl>"
+        assert s.filename == "<repl:prelude>"
         assert s.prelude == DEFAULT_PRELUDE
         assert s.inputs == []
         assert s.n_done == 0
@@ -483,6 +522,17 @@ class TestExecuteMode:
         s.run("x = 4")
         assert s.run("x") == "4"
 
+    def test_main_must_be_indented_with_4_spaces(self, make_session):
+        # with -x, the inputs are injected into the body of main with a
+        # 4-space indent: a main indented differently is rejected at startup
+        for i, src in enumerate(
+            ["def main() -> None:\n  x = 1\n", "def main() -> None:\n\tx = 1\n"]
+        ):
+            with pytest.raises(SPyError) as exc:
+                make_session(src, name=f"badindent{i}", run_main=[])
+            assert exc.value.etype == "W_TypeError"
+            assert "indented with 4 spaces" in exc.value.w_exc.message
+
     def test_no_main(self, make_session):
         with pytest.raises(SPyError) as exc:
             make_session("x = 1\n", name="nomain", run_main=[])
@@ -562,6 +612,21 @@ class TestCompleteAndInspect:
         assert completer("squa", 1) is None
         assert completer("nosuch.", 0) is None  # errors are swallowed
 
+    def test_complete_edge_cases(self, make_session, monkeypatch):
+        s = make_session()
+        # nothing before the dot: no completions, and no crash
+        assert s.complete(".x") == []
+        assert s.complete(".") == []
+        completer = _make_completer(s)
+        assert completer(".x", 0) is None
+
+        # the readline completer swallows any error, not just SPyError
+        def boom(prefix):
+            raise IndexError("boom")
+
+        monkeypatch.setattr(s, "complete", boom)
+        assert completer("x", 0) is None
+
 
 class TestCli:
     def test_repl_without_file(self):
@@ -613,6 +678,13 @@ class TestCli:
         res = CliRunner().invoke(app, ["repl", str(f), "extra"], input="")
         assert res.exit_code != 0
         assert "-x/--execute" in res.output
+
+    def test_repl_x_main_must_be_indented_with_4_spaces(self, tmp_path):
+        f = tmp_path / "mymod.spy"
+        f.write_text("def main() -> None:\n  x = 1\n")
+        res = CliRunner().invoke(app, ["repl", "-x", str(f)], input="")
+        assert res.exit_code != 0
+        assert "indented with 4 spaces" in res.output
 
     def test_execute_interactive(self, tmp_path):
         # `spy -i FILE [ARGS...]` is the same as `ispy -x FILE [ARGS...]`

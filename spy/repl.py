@@ -33,15 +33,17 @@ the new input). This is simple and gives the correct scoping for free. Then we
 execute in the live frame only the statements which are new. In `-x` mode the
 inputs are appended to the body of `main` instead, and executed in its frame.
 
-When the session is based on a FILE, the locs of the inputs are rewritten to
-point to the pseudo-file `<repl>`, with line numbers relative to the inputs
-themselves: tracebacks and error messages about the inputs show `<repl>`,
-not the FILE and the line numbers of the combined source.
+The locs of the inputs are rewritten to point to the pseudo-file `<repl>`,
+with line numbers relative to the inputs themselves: tracebacks and error
+messages about the inputs show `<repl>`, not the FILE (or `<repl:prelude>`,
+the pseudo-file of the prelude when the session is not based on a FILE) and
+not the line numbers of the combined source.
 
 The interactive loop (run_repl) uses readline when available: line editing,
 a history file (HISTORY_FILE, like ~/.python_history for python) and tab
-completion (see ReplSession.complete). Lines starting with `?` (or ending
-with `?`) print help about a name: see ReplSession.inspect.
+completion (see ReplSession.complete). Lines starting with `?`, or a plain
+name ending with `?` (e.g. `square?`), print help about that name: see
+ReplSession.inspect.
 """
 
 import codeop
@@ -50,6 +52,7 @@ import dataclasses
 import linecache
 import sys
 import textwrap
+import traceback
 from pathlib import Path
 from typing import IO, Any, Callable, Optional
 
@@ -77,6 +80,11 @@ REPL_MAIN = "__repl_main__"
 # Pseudo-filename shown in tracebacks and error messages for the inputs typed
 # at the prompt (as opposed to the prelude, which keeps its real filename).
 REPL_FILENAME = "<repl>"
+
+# Pseudo-filename of the whole module source (the prelude, plus the repl main)
+# of a session which is not based on a FILE. It must be different from
+# REPL_FILENAME, otherwise the two compete for the same linecache key.
+REPL_PRELUDE_FILENAME = "<repl:prelude>"
 
 # Default history file of `ispy`.
 HISTORY_FILE = Path.home() / ".ispy_history"
@@ -211,7 +219,7 @@ class ReplSession:
             self.modname = filename.stem
             file_src = filename.read_text()
         else:
-            self.filename = REPL_FILENAME
+            self.filename = REPL_PRELUDE_FILENAME
             self.modname = "repl"
             file_src = ""
         self.use_spyc = use_spyc
@@ -235,6 +243,7 @@ class ReplSession:
         if run_main is not None:
             # -x implies main scope: main() is run by enter_main()
             module_scope = False
+            self._check_main_indentation()
         if not module_scope:
             self.enter_main()
 
@@ -278,17 +287,17 @@ class ReplSession:
         Parse, analyze and astcompile the prelude + the repl main containing `inputs`
         (or, in -x mode, the prelude with `inputs` appended to the body of `main`).
 
-        When the session is based on a FILE, the locs of the inputs are rewritten
-        to point to the pseudo-file `<repl>` (see _localize_inputs), so that
-        tracebacks and error messages about the inputs show `<repl>` instead of
-        the FILE and the line numbers of the combined source.
+        The locs of the inputs are rewritten to point to the pseudo-file `<repl>`
+        (see _localize_inputs), so that tracebacks and error messages about the
+        inputs show `<repl>` with line numbers relative to the inputs, instead of
+        the FILE (or `<repl:prelude>`) and the line numbers of the combined source.
         """
         if self.run_main is not None:
             src, offset, n_orig = self._main_src(inputs)
         else:
             src, offset, n_orig = self._repl_main_src(inputs)
         parsed = self._parse(src)
-        if inputs and self.filename != REPL_FILENAME:
+        if inputs:
             parsed = self._localize_inputs(parsed, offset, n_orig)
             self._record_repl_src(inputs)
         assert parsed.scoping_rules in ("strict", "pythonic")
@@ -317,6 +326,38 @@ class ReplSession:
         head = self._module_src(f"\n\ndef {REPL_MAIN}() -> None:\n")
         return head + body, head.count("\n"), 0
 
+    def _find_main(self, src: str) -> Optional[ast.FuncDef]:
+        """
+        The `main` funcdef of the module source `src`, if the module defines one.
+        """
+        parsed = Parser(src, self.filename).parse()
+        for decl in parsed.decls:
+            if isinstance(decl, ast.GlobalFuncDef) and decl.funcdef.name == "main":
+                return decl.funcdef
+        return None
+
+    def _check_main_indentation(self) -> None:
+        """
+        With -x, the inputs are injected into the body of `main` with a
+        4-space indent (see _main_src): check that the body of `main` is
+        actually indented with 4 spaces.
+        """
+        src = self._module_src()
+        funcdef = self._find_main(src)
+        if funcdef is None:
+            return  # the missing `main` is reported later by _main_src
+        lines = src.splitlines(keepends=True)
+        for stmt in funcdef.body.body:
+            if stmt.loc.line_start == funcdef.loc.line_start:
+                continue  # `def main(): <stmt>` on a single line is fine
+            ws = lines[stmt.loc.line_start - 1][: stmt.loc.col_start]
+            if ws != "    ":
+                raise SPyError(
+                    "W_TypeError",
+                    f"cannot use -x with `{self.filename}`: "
+                    "the body of `main` must be indented with 4 spaces",
+                )
+
     def _main_src(self, inputs: list[str]) -> tuple[str, int, int]:
         """
         The whole module source in -x mode: the prelude, with `inputs` appended
@@ -328,12 +369,7 @@ class ReplSession:
         src = self._module_src()
         if not inputs:
             return src, 0, 0
-        parsed = Parser(src, self.filename).parse()
-        funcdef: Optional[ast.FuncDef] = None
-        for decl in parsed.decls:
-            if isinstance(decl, ast.GlobalFuncDef) and decl.funcdef.name == "main":
-                funcdef = decl.funcdef
-                break
+        funcdef = self._find_main(src)
         if funcdef is None:
             raise SPyError("W_TypeError", f"`{self.filename}` does not define `main`")
         n_orig = len(funcdef.body.body)
@@ -475,7 +511,7 @@ class ReplSession:
         default prelude. A fresh module name is used, because a module which
         has already been imported cannot be redefined.
         """
-        self.filename = REPL_FILENAME
+        self.filename = REPL_PRELUDE_FILENAME
         self.modname = self._fresh_modname()
         self.prelude = DEFAULT_PRELUDE
         self.mode = "module"
@@ -578,6 +614,8 @@ class ReplSession:
         """
         if "." in prefix:
             base, _, attr_prefix = prefix.rpartition(".")
+            if not base:
+                return []  # e.g. ".x": there is nothing before the dot
             w_obj = self._eval_chain(base)
             return sorted(
                 f"{base}.{attr}"
@@ -648,6 +686,8 @@ class ReplSession:
         is rejected: this guarantees that completing and inspecting never have
         side effects.
         """
+        if not src.strip():
+            raise SPyError("W_TypeError", f"cannot evaluate `{src}`")
         filename = record_src_in_linecache(src, name="repl-eval")
         stmt = Parser(src, filename).parse_single_stmt()
         node: Optional[ast.Expr] = (
@@ -713,6 +753,19 @@ class ReplSession:
         names = self.vm.dynamic_type(w_obj).spy_dir(self.vm)
         names.update(w_obj.spy_dir(self.vm))
         return names
+
+
+def _is_help_request(line: str) -> bool:
+    """
+    Whether `line` is a `NAME?` help request: it must end with `?`, and the
+    part before the `?` must be a plain name or an attribute chain, so that
+    e.g. `x = 1  # why?` is executed as normal code, not treated as help.
+    """
+    rline = line.rstrip()
+    if not rline.endswith("?"):
+        return False
+    rest = rline[:-1].strip()
+    return bool(rest) and all(part.isidentifier() for part in rest.split("."))
 
 
 def is_complete(src: str) -> bool:
@@ -788,7 +841,8 @@ def _make_completer(session: ReplSession) -> Callable[[str, int], Optional[str]]
         if state == 0:
             try:
                 matches = session.complete(text)
-            except SPyError:
+            except Exception:
+                # readline must never die because of a completion error
                 matches = []
         if 0 <= state < len(matches):
             return matches[state]
@@ -888,11 +942,7 @@ def run_repl(
             if not buf and line.startswith("?"):
                 run_help(session, line[1:], out=out)
                 continue
-            if (
-                not buf
-                and not line.startswith(("%", "?"))
-                and line.rstrip().endswith("?")
-            ):
+            if not buf and not line.startswith(("%", "?")) and _is_help_request(line):
                 run_help(session, line.rstrip()[:-1], out=out)
                 continue
             if not buf and line.startswith("%"):
@@ -915,6 +965,15 @@ def run_repl(
                     res = session.run(src)
             except SPyError as e:
                 print(e.format(use_colors=use_colors), file=out)
+            except KeyboardInterrupt:
+                # ^C during the execution of an input: the input is dropped
+                # (session.run already rolled back the locals) and the session
+                # stays alive
+                print("\nKeyboardInterrupt", file=out)
+            except Exception:
+                # an internal error (a bug in SPy): show the traceback, but
+                # keep the session alive
+                traceback.print_exc(file=out)
             else:
                 if res is not None:
                     print(res, file=out)
