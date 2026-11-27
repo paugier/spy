@@ -843,7 +843,17 @@ def run_repl(
             # '.' must NOT be a word delimiter: `math.sq` is completed as a whole
             readline_mod.set_completer_delims(" \t\n()[]{}'\",:;")
             readline_mod.set_completer(_make_completer(session))
-            readline_mod.parse_and_bind("tab: complete")
+            # readline_mod.backend was introduced in Python 3.13
+            backend = getattr(readline_mod, "backend", None)
+            is_libedit = (
+                backend == "editline"
+                if backend is not None
+                else "libedit" in (readline_mod.__doc__ or "")
+            )
+            if is_libedit:
+                readline_mod.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline_mod.parse_and_bind("tab: complete")
         read_line = input
 
     if session.main_error is not None:
