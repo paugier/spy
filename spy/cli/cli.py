@@ -31,7 +31,7 @@ app = SpyTyper(
 
 app.spy_command(execute, name="execute", default=True, strict_argv=True)
 app.spy_command(build, name="build", strict_argv=True)
-app.spy_command(repl, name="repl")
+app.spy_command(repl, name="repl", strict_argv=True)
 app.spy_command(redshift, name="redshift | rs", strict_argv=True)
 app.spy_command(colorize, name="colorize")
 app.spy_command(astcompile, name="astcompile")

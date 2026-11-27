@@ -34,6 +34,23 @@ def make_session(tmp_path):
     return make
 
 
+@pytest.fixture
+def make_x_session(tmp_path):
+    """
+    Like make_session, but for -x mode: main() of the file is run first, and
+    the session starts in its frame.
+    """
+
+    def make(src, args=None, name="xmod"):
+        f = tmp_path / f"{name}.spy"
+        f.write_text(textwrap.dedent(src))
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        return ReplSession(vm, f, use_spyc=False, run_main=args or [])
+
+    return make
+
+
 def run_lines(session: ReplSession, lines: list[str]) -> tuple[str, list[str]]:
     """
     Run `run_repl` on `session`, feeding it `lines`; return (output, prompts).
@@ -377,3 +394,305 @@ class TestRepl:
         out, _ = run_lines(s, ["%frobnicate", "1 + 1"])
         assert "unknown command `%frobnicate`" in out
         assert out.rstrip().endswith("2")
+
+    # %reset
+
+    def test_reset(self, make_session):
+        s = make_session()
+        assert s.modname == "mymod"
+        s.run("x = 3")
+        s.reset()
+        assert s.mode == "module"
+        assert s.filename == "<repl>"
+        assert s.prelude == DEFAULT_PRELUDE
+        assert s.inputs == []
+        assert s.n_done == 0
+        assert s.frame is None
+        # `mymod` is already imported and cannot be redefined: a fresh module
+        # name is used
+        assert s.modname == "repl"
+        s.enter_main()
+        assert s.run("1 + 1") == "2"
+        s.reset()
+        assert s.modname == "repl_2"
+        s.enter_main()
+        assert s.run("2 + 2") == "4"
+
+    def test_reset_forgets_inputs(self, make_session):
+        s = make_session()
+        s.run("x = 3")
+        s.reset()
+        s.add_module_input("def double(x: i32) -> i32:\n    return 2 * x")
+        s.enter_main()
+        assert s.run("double(21)") == "42"
+        with pytest.raises(SPyError) as exc:
+            s.run("x")
+        assert exc.value.etype == "W_NameError"
+
+    def test_reset_in_module_scope(self):
+        s = ReplSession(SPyVM(), None, module_scope=True, use_spyc=False)
+        s.add_module_input("def square(x: i32) -> i32:\n    return x * x")
+        s.reset()
+        assert s.mode == "module"
+        assert s.prelude == DEFAULT_PRELUDE
+        assert "square" not in s.prelude
+        # the module was never imported, so the name `repl` is still available
+        assert s.modname == "repl"
+        s.add_module_input("def cube(x: i32) -> i32:\n    return x * x * x")
+        s.enter_main()
+        assert s.run("cube(3)") == "27"
+        with pytest.raises(SPyError) as exc:
+            s.run("square(3)")
+        assert exc.value.etype == "W_NameError"
+
+    def test_reset_command_in_main_scope(self, make_session):
+        s = make_session()
+        lines = [
+            "x = 1",
+            "%reset",
+            "def f() -> i32:",
+            "    return 7",
+            "",
+            "%main",
+            "f()",
+            "x",
+        ]
+        out, prompts = run_lines(s, lines)
+        assert "7" in out
+        assert "NameError" in out
+        assert prompts == [
+            ">>> ",
+            ">>> ",
+            "module>>> ",
+            "... ",
+            "... ",
+            "module>>> ",
+            ">>> ",
+            ">>> ",
+            ">>> ",
+        ]
+        assert s.mode == "main"
+
+    def test_reset_command_in_module_scope(self):
+        s = ReplSession(SPyVM(), None, module_scope=True, use_spyc=False)
+        s.add_module_input("def square(x: i32) -> i32:\n    return x * x")
+        out, prompts = run_lines(s, ["%reset", "%main", "1 + 1"])
+        assert out.rstrip().endswith("2")
+        assert "NameError" not in out
+        assert prompts[0] == "module>>> "
+        assert prompts[1] == "module>>> "
+        assert prompts[2] == ">>> "
+
+    # -x: run main() first, then start the session in its frame
+
+    def test_x_runs_main_first(self, make_x_session, capsys):
+        s = make_x_session("""
+            def main() -> None:
+                print("hello from main")
+        """)
+        assert capsys.readouterr().out == "hello from main\n"
+        assert s.mode == "main"
+        assert s.main_error is None
+        assert s.main_exit_code is None
+
+    def test_x_locals_of_main_are_visible(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None:
+                x = 3
+                total = 0
+                for i in range(4):
+                    total += i
+        """)
+        assert s.run("x") == "3"
+        assert s.run("total") == "6"
+
+    def test_x_inputs_run_in_main_frame(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None:
+                x = 3
+                total = 0
+                for i in range(4):
+                    total += i
+        """)
+        s.run("x = 10")
+        assert s.run("x") == "10"
+        assert s.run("x + total") == "16"
+        # a `for` in an input compiles to several stmts: check that we execute
+        # them all, without re-executing main's body
+        s.run("for j in range(2):\n    total += 10")
+        assert s.run("total") == "26"
+
+    def test_x_file_definitions_are_visible(self, make_x_session):
+        s = make_x_session("""
+            def square(x: i32) -> i32:
+                return x * x
+
+            def main() -> None:
+                pass
+        """)
+        assert s.run("square(6)") == "36"
+
+    def test_x_argv(self, make_x_session, capsys):
+        s = make_x_session(
+            """
+            def main(argv: list[str]) -> None:
+                n = len(argv)
+                for a in argv:
+                    print(a)
+            """,
+            args=["hello", "world"],
+        )
+        assert capsys.readouterr().out.splitlines() == [s.filename, "hello", "world"]
+        assert s.run("n") == "3"  # FILE + 2 args
+
+    def test_x_main_raises_but_session_still_starts(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None:
+                x = 1
+                raise ValueError('boom')
+        """)
+        assert s.mode == "main"
+        assert s.main_error is not None
+        assert s.main_error.etype == "W_ValueError"
+        # the locals set before the raise are available at the prompt
+        assert s.run("x") == "1"
+
+    def test_x_main_error_is_printed(self, make_x_session):
+        s = make_x_session(
+            """
+            def main() -> None:
+                raise ValueError('boom')
+            """,
+            name="xraise",
+        )
+        out, _ = run_lines(s, ["1 + 1"])
+        assert "ValueError" in out
+        assert "boom" in out
+        assert out.rstrip().endswith("2")
+
+    def test_x_exit_code_does_not_end_the_session(self, make_x_session):
+        s = make_x_session("""
+            def main() -> i32:
+                x = 5
+                return 42
+        """)
+        assert s.main_exit_code == 42
+        assert s.mode == "main"
+        assert s.run("x") == "5"
+        assert s.run("x * 2") == "10"
+
+    def test_x_input_error_rolls_back_locals(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None:
+                x = 1
+        """)
+        with pytest.raises(SPyError) as exc:
+            s.run("x = 2\nraise ValueError('boom')")
+        assert exc.value.etype == "W_ValueError"
+        assert s.run("x") == "1"
+
+    def test_x_single_line_main(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None: x = 3
+        """)
+        assert s.run("x") == "3"
+        s.run("x = 4")
+        assert s.run("x") == "4"
+
+    def test_x_no_main(self, tmp_path):
+        f = tmp_path / "nomain.spy"
+        f.write_text("x = 1\n")
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        with pytest.raises(SPyError) as exc:
+            ReplSession(vm, f, use_spyc=False, run_main=[])
+        assert exc.value.etype == "W_TypeError"
+        assert "main" in exc.value.w_exc.message
+
+    def test_x_wrong_main_signature(self, tmp_path):
+        f = tmp_path / "badsig.spy"
+        f.write_text("def main(x: i32) -> None:\n    pass\n")
+        vm = SPyVM()
+        vm.path.append(str(tmp_path))
+        with pytest.raises(SPyError) as exc:
+            ReplSession(vm, f, use_spyc=False, run_main=[])
+        assert exc.value.etype == "W_TypeError"
+
+    def test_x_reset_clears_run_main(self, make_x_session):
+        s = make_x_session("""
+            def main() -> None:
+                x = 1
+        """)
+        s.reset()
+        assert s.run_main is None
+        assert s.main_error is None
+        assert s.mode == "module"
+        s.enter_main()
+        # we are back to the normal repl main: `x` is not defined anymore
+        with pytest.raises(SPyError) as exc:
+            s.run("x")
+        assert exc.value.etype == "W_NameError"
+
+    # CLI: -x and -i
+
+    def test_repl_command_x(self, tmp_path):
+        f = tmp_path / "mymod.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def main(argv: list[str]) -> None:
+                    n = len(argv)
+                    for a in argv:
+                        print(a)
+                """
+            )
+        )
+        res = CliRunner().invoke(
+            app, ["repl", "-x", str(f), "hello"], input="n\nexit\n"
+        )
+        assert res.exit_code == 0, res.output
+        lines = res.stdout.splitlines()
+        assert lines[0] == str(f)
+        assert lines[1] == "hello"
+        assert lines[2] == ">>> 2"  # the repr of `n`, after the prompt
+
+    def test_repl_command_x_requires_file(self):
+        res = CliRunner().invoke(app, ["repl", "-x"], input="")
+        assert res.exit_code != 0
+        assert "requires a FILE" in res.output
+
+    def test_repl_command_argv_without_x(self, tmp_path):
+        f = tmp_path / "mymod.spy"
+        f.write_text(textwrap.dedent(PRELUDE))
+        res = CliRunner().invoke(app, ["repl", str(f), "extra"], input="exit\n")
+        assert res.exit_code != 0
+        assert "-x/--execute" in res.output
+
+    def test_execute_command_interactive(self, tmp_path):
+        # `spy -i FILE [ARGS...]` is the same as `ispy -x FILE [ARGS...]`
+        f = tmp_path / "mymod.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def main() -> None:
+                    x = 21
+                """
+            )
+        )
+        res = CliRunner().invoke(app, ["-i", str(f)], input="x * 2\nexit\n")
+        assert res.exit_code == 0, res.output
+        assert "42" in res.stdout
+
+    def test_execute_command_interactive_with_args(self, tmp_path):
+        f = tmp_path / "mymod.spy"
+        f.write_text(
+            textwrap.dedent(
+                """
+                def main(argv: list[str]) -> None:
+                    n = len(argv)
+                """
+            )
+        )
+        res = CliRunner().invoke(app, ["-i", str(f), "a", "b"], input="n\nexit\n")
+        assert res.exit_code == 0, res.output
+        assert ">>> 3\n" in res.stdout
