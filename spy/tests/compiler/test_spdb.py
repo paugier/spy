@@ -31,6 +31,24 @@ def w_spdb_interact(vm: "SPyVM", w_session: W_Str) -> None:
     spdb_expect(vm, w_tb, session, post_mortem=False)
 
 
+@TESTMOD.builtin_func
+def w_spdb_complete(vm: "SPyVM", w_prefix: W_Str) -> W_Str:
+    """
+    Return the completions of `prefix` in the current app-level frame, as seen by
+    SPdb, separated by spaces.
+    """
+    pyframe = sys._getframe().f_back.f_back  # type: ignore
+    assert pyframe is not None
+    w_tb = W_Traceback.from_py_frame(pyframe)
+    spdb = SPdb(vm, w_tb, stdout=StringIO(), use_colors=False)
+    spdb.select_frame(len(w_tb.entries) - 1)
+    try:
+        names = spdb.introspector().complete(vm.unwrap_str(w_prefix))
+    except SPyError:
+        names = []  # like in SPdb.complete, which is called by readline
+    return vm.wrap(" ".join(names))  # type: ignore
+
+
 def spdb_expect(
     vm: "SPyVM", w_tb: W_Traceback, session: str, *, post_mortem: bool
 ) -> None:
@@ -266,6 +284,59 @@ class TestSPdb(CompilerTest):
         mod = self.compile(src)
         res = mod.foo(41, session)
         assert res == 42
+
+    def test_help(self):
+        src = """
+        from _test import spdb_interact
+        import math
+
+        def square(x: int) -> int:
+            return x * x
+
+        def foo(x: int, session: str) -> int:
+            spdb_interact(session)
+            return x
+        """
+        session = f"""
+        --- entering applevel debugger ---
+           [0] test::foo at {self.filename}:9
+            |     spdb_interact(session)
+            |     |____________________|
+        (spdb) ?x
+        type: i32
+        (spdb) x?
+        type: i32
+        (spdb) ?math
+        module math
+        (spdb) square?
+        def square(i32) -> i32
+        test::square
+        (spdb) ?nosuch
+        *** NameError: name `nosuch` is not defined
+        (spdb) ?
+        usage: ?NAME or NAME?
+        (spdb) continue
+        """
+        mod = self.compile(src)
+        mod.foo(42, session)
+
+    def test_complete(self):
+        src = """
+        from _test import spdb_complete
+        import math
+
+        def square(x: int) -> int:
+            return x * x
+
+        def foo(abc: int, abd: int) -> str:
+            res = spdb_complete("ab")
+            res += "|" + spdb_complete("math.sq")
+            res += "|" + spdb_complete("squa")
+            res += "|" + spdb_complete("nosuch.")
+            return res
+        """
+        mod = self.compile(src)
+        assert mod.foo(1, 2) == "abc abd|math.sqrt|square|"
 
     def test_name_lookup(self):
         src = """

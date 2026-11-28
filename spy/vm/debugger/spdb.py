@@ -20,6 +20,7 @@ from spy.util import record_src_in_linecache
 from spy.vm.astframe import AbstractFrame, ASTFrame
 from spy.vm.b import BUILTINS
 from spy.vm.classframe import ClassFrame
+from spy.vm.debugger.introspect import Introspector, is_help_request
 from spy.vm.debugger.longlist import print_longlist
 from spy.vm.exc import TBEntry, W_Traceback
 from spy.vm.modframe import ModFrame
@@ -31,6 +32,14 @@ if TYPE_CHECKING:
     from spy.vm.vm import SPyVM
 
 FILE = Optional[IO[str]]
+
+
+def readline_line_buffer() -> str:
+    try:
+        import readline
+    except ImportError:
+        return ""
+    return readline.get_line_buffer()
 
 
 @BUILTINS.builtin_func
@@ -88,6 +97,7 @@ class SPdb(cmd.Cmd):
         self.vm = vm
         self.w_tb = w_tb
         self.curindex = -1  # currently selected frame
+        self.completion_matches: list[str] = []
 
     def interaction(self) -> None:
         print("--- entering applevel debugger ---", file=self.stdout)
@@ -250,3 +260,56 @@ class SPdb(cmd.Cmd):
             self.error(f"{etype}: {message}")
 
     do_p = do_print
+
+    # === tab completion and ? help ===
+    #
+    # Same behavior as in the REPL (see spy.vm.debugger.introspect), but on the
+    # currently selected frame.
+
+    def introspector(self) -> Introspector:
+        f = self.get_curframe()
+        return Introspector(self.vm, f.spyframe, f.fqn.modname)
+
+    def onecmd(self, line: str) -> bool:
+        # `?name` and `name?` must be intercepted before cmd.Cmd, which would turn
+        # `?` into `help`. We don't define a `do_inspect` command, so that it does not
+        # hide a variable called `inspect`.
+        stripped = line.strip()
+        if stripped.startswith("?") or is_help_request(stripped):
+            name = stripped.lstrip("?").rstrip("?").strip()
+            self.print_help(name)
+            return False
+        return super().onecmd(line)
+
+    def print_help(self, name: str) -> None:
+        if not name:
+            print("usage: ?NAME or NAME?", file=self.stdout)
+            return
+        try:
+            print(self.introspector().inspect(name), file=self.stdout)
+        except SPyError as e:
+            self.error(f"{e.etype[2:]}: {e.w_exc.message}")
+
+    def complete(self, text: str, state: int) -> Optional[str]:  # type: ignore[override]
+        """
+        Called by readline: complete the commands (at the beginning of the line) and
+        the names visible in the current frame.
+        """
+        if state == 0:
+            try:
+                names = self.introspector().complete(text)
+            except Exception:
+                # readline must never die because of a completion error
+                names = []
+            line = readline_line_buffer()
+            if line.lstrip() == text:  # we are completing the first word
+                cmds = {
+                    n[3:]
+                    for n in self.get_names()
+                    if n.startswith("do_") and n != "do_EOF"
+                }
+                names = sorted(set(names) | {c for c in cmds if c.startswith(text)})
+            self.completion_matches = names
+        if 0 <= state < len(self.completion_matches):
+            return self.completion_matches[state]
+        return None
