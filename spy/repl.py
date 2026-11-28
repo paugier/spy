@@ -44,13 +44,15 @@ The interactive loop (run_repl) uses readline when available: line editing,
 a history file (HISTORY_FILE, like ~/.python_history for python) and tab
 completion (see ReplSession.complete). Lines starting with `?`, or a plain
 name ending with `?` (e.g. `square?`), print help about that name: see
-ReplSession.inspect.
+ReplSession.inspect. Lines starting with `!` run a shell command (e.g. `!ls`),
+like in IPython: see run_shell.
 """
 
 import codeop
 import copy
 import dataclasses
 import linecache
+import subprocess
 import sys
 import textwrap
 import traceback
@@ -812,6 +814,21 @@ def run_command(
         print(f"unknown command `{cmd}`", file=out)
 
 
+def run_shell(line: str, *, out: IO[str]) -> None:
+    """
+    `!CMD`: run CMD in a shell, like in IPython, and print its output.
+    """
+    cmd = line[1:].strip()
+    if not cmd:
+        print("usage: !CMD", file=out)
+        return
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if res.stdout:
+        print(res.stdout, end="", file=out)
+    if res.stderr:
+        print(res.stderr, end="", file=out)
+
+
 def run_help(session: ReplSession, arg: str, *, out: IO[str]) -> None:
     """
     `?NAME` (or `NAME?`): print help about NAME. See ReplSession.inspect.
@@ -938,11 +955,21 @@ def run_repl(
             if not buf and line.startswith("?"):
                 run_help(session, line[1:], out=out)
                 continue
-            if not buf and not line.startswith(("%", "?")) and _is_help_request(line):
+            if (
+                not buf
+                and not line.startswith(("%", "?", "!"))
+                and _is_help_request(line)
+            ):
                 run_help(session, line.rstrip()[:-1], out=out)
                 continue
             if not buf and line.startswith("%"):
                 run_command(session, line.strip(), out=out, use_colors=use_colors)
+                continue
+            if not buf and line.startswith("!"):
+                try:
+                    run_shell(line, out=out)
+                except KeyboardInterrupt:
+                    print("\nKeyboardInterrupt", file=out)
                 continue
             buf.append(line)
             src = "\n".join(buf)

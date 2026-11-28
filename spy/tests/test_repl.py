@@ -266,6 +266,40 @@ class TestRunRepl:
         # `square?` is still a help request
         assert "def square(i32) -> i32" in out
 
+    def test_shell_escape(self, make_session):
+        s = make_session()
+        lines = [
+            "!echo hello",
+            "!echo oops 1>&2",
+            "!false",  # a failing command does not stop the loop
+            "!",
+            "1 + 1",
+            "exit",
+        ]
+        out, prompts = run_lines(s, lines)
+        assert "hello\n" in out
+        assert "oops\n" in out
+        assert "usage: !CMD" in out
+        assert out.rstrip().endswith("2")
+        assert prompts == [">>> "] * 6
+
+    def test_shell_escape_in_module_scope(self):
+        s = bare_session(module_scope=True)
+        out, prompts = run_lines(s, ["!echo hi", "%main", "1 + 1", "exit"])
+        assert "hi\n" in out
+        assert out.rstrip().endswith("2")
+        assert prompts == ["module>>> ", "module>>> ", ">>> ", ">>> "]
+
+    def test_shell_escape_only_at_top_level(self, make_session, tmp_path):
+        # inside a multi-line input, `!` is not special: it is SPy code (and
+        # a syntax error here), so the command is not executed
+        s = make_session()
+        marker = tmp_path / "SHELLRAN"
+        out, _ = run_lines(s, ["if True:", f"!touch {marker}", "", "1 + 1", "exit"])
+        assert not marker.exists()
+        assert "ParseError" in out
+        assert out.rstrip().endswith("2")
+
     def test_history_file(self, make_session, tmp_path, monkeypatch):
         readline.clear_history()
         hf = tmp_path / "ispy_history"
